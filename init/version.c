@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  linux/init/version.c
  *
@@ -6,28 +7,48 @@
  *  May be freely distributed as part of Linux.
  */
 
-#include <linux/compile.h>
-#include <linux/module.h>
+#include <generated/compile.h>
+#include <linux/build-salt.h>
+#include <linux/elfnote-lto.h>
+#include <linux/export.h>
+#include <linux/init.h>
+#include <linux/printk.h>
 #include <linux/uts.h>
 #include <linux/utsname.h>
-#include <linux/version.h>
+#include <linux/proc_ns.h>
 
-#define version(a) Version_ ## a
-#define version_string(a) version(a)
+static int __init early_hostname(char *arg)
+{
+	size_t bufsize = sizeof(init_uts_ns.name.nodename);
+	size_t maxlen  = bufsize - 1;
+	ssize_t arglen;
 
-int version_string(LINUX_VERSION_CODE);
+	arglen = strscpy(init_uts_ns.name.nodename, arg, bufsize);
+	if (arglen < 0) {
+		pr_warn("hostname parameter exceeds %zd characters and will be truncated",
+			maxlen);
+	}
+	return 0;
+}
+early_param("hostname", early_hostname);
 
-struct new_utsname system_utsname = {
-	.sysname	= UTS_SYSNAME,
-	.nodename	= UTS_NODENAME,
-	.release	= UTS_RELEASE,
-	.version	= UTS_VERSION,
-	.machine	= UTS_MACHINE,
-	.domainname	= UTS_DOMAINNAME,
-};
+const char linux_proc_banner[] =
+	"%s version %s"
+	" (" LINUX_COMPILE_BY "@" LINUX_COMPILE_HOST ")"
+	" (" LINUX_COMPILER ") %s\n";
 
-EXPORT_SYMBOL(system_utsname);
+BUILD_SALT;
+BUILD_LTO_INFO;
 
-const char linux_banner[] =
-	"Linux version " UTS_RELEASE " (" LINUX_COMPILE_BY "@"
-	LINUX_COMPILE_HOST ") (" LINUX_COMPILER ") " UTS_VERSION "\n";
+/*
+ * init_uts_ns and linux_banner contain the build version and timestamp,
+ * which are really fixed at the very last step of build process.
+ * They are compiled with __weak first, and without __weak later.
+ */
+
+struct uts_namespace init_uts_ns __weak;
+const char linux_banner[] __weak;
+
+#include "version-timestamp.c"
+
+EXPORT_SYMBOL_GPL(init_uts_ns);

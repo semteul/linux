@@ -1,35 +1,26 @@
-/* elf-fdpic.h: FDPIC ELF load map
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* FDPIC ELF load map
  *
  * Copyright (C) 2003 Red Hat, Inc. All Rights Reserved.
  * Written by David Howells (dhowells@redhat.com)
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
  */
 
 #ifndef _LINUX_ELF_FDPIC_H
 #define _LINUX_ELF_FDPIC_H
 
-#include <linux/elf.h>
+#include <uapi/linux/elf-fdpic.h>
 
-#define PT_GNU_STACK    (PT_LOOS + 0x474e551)
-
-/* segment mappings for ELF FDPIC libraries/executables/interpreters */
-struct elf32_fdpic_loadseg {
-	Elf32_Addr	addr;		/* core address to which mapped */
-	Elf32_Addr	p_vaddr;	/* VMA recorded in file */
-	Elf32_Word	p_memsz;	/* allocation size recorded in file */
-};
-
-struct elf32_fdpic_loadmap {
-	Elf32_Half	version;	/* version of these structures, just in case... */
-	Elf32_Half	nsegs;		/* number of segments */
-	struct elf32_fdpic_loadseg segs[];
-};
-
-#define ELF32_FDPIC_LOADMAP_VERSION	0x0000
+#if ELF_CLASS == ELFCLASS32
+#define Elf_Sword			Elf32_Sword
+#define elf_fdpic_loadseg		elf32_fdpic_loadseg
+#define elf_fdpic_loadmap		elf32_fdpic_loadmap
+#define ELF_FDPIC_LOADMAP_VERSION	ELF32_FDPIC_LOADMAP_VERSION
+#else
+#define Elf_Sword			Elf64_Sxword
+#define elf_fdpic_loadmap		elf64_fdpic_loadmap
+#define elf_fdpic_loadseg		elf64_fdpic_loadseg
+#define ELF_FDPIC_LOADMAP_VERSION	ELF64_FDPIC_LOADMAP_VERSION
+#endif
 
 /*
  * binfmt binary parameters structure
@@ -37,7 +28,7 @@ struct elf32_fdpic_loadmap {
 struct elf_fdpic_params {
 	struct elfhdr			hdr;		/* ref copy of ELF header */
 	struct elf_phdr			*phdrs;		/* ref copy of PT_PHDR table */
-	struct elf32_fdpic_loadmap	*loadmap;	/* loadmap to be passed to userspace */
+	struct elf_fdpic_loadmap	*loadmap;	/* loadmap to be passed to userspace */
 	unsigned long			elfhdr_addr;	/* mapped ELF header user address */
 	unsigned long			ph_addr;	/* mapped PT_PHDR user address */
 	unsigned long			map_addr;	/* mapped loadmap user address */

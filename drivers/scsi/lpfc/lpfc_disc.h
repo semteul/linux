@@ -1,29 +1,27 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
- * Enterprise Fibre Channel Host Bus Adapters.                     *
- * Refer to the README file included with this package for         *
- * driver version and adapter support.                             *
- * Copyright (C) 2004 Emulex Corporation.                          *
- * www.emulex.com                                                  *
+ * Fibre Channel Host Bus Adapters.                                *
+ * Copyright (C) 2017-2022 Broadcom. All Rights Reserved. The term *
+ * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
+ * Copyright (C) 2004-2013 Emulex.  All rights reserved.           *
+ * EMULEX and SLI are trademarks of Emulex.                        *
+ * www.broadcom.com                                                *
  *                                                                 *
  * This program is free software; you can redistribute it and/or   *
- * modify it under the terms of the GNU General Public License     *
- * as published by the Free Software Foundation; either version 2  *
- * of the License, or (at your option) any later version.          *
- *                                                                 *
- * This program is distributed in the hope that it will be useful, *
- * but WITHOUT ANY WARRANTY; without even the implied warranty of  *
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the   *
- * GNU General Public License for more details, a copy of which    *
- * can be found in the file COPYING included with this package.    *
+ * modify it under the terms of version 2 of the GNU General       *
+ * Public License as published by the Free Software Foundation.    *
+ * This program is distributed in the hope that it will be useful. *
+ * ALL EXPRESS OR IMPLIED CONDITIONS, REPRESENTATIONS AND          *
+ * WARRANTIES, INCLUDING ANY IMPLIED WARRANTY OF MERCHANTABILITY,  *
+ * FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT, ARE      *
+ * DISCLAIMED, EXCEPT TO THE EXTENT THAT SUCH DISCLAIMERS ARE HELD *
+ * TO BE LEGALLY INVALID.  See the GNU General Public License for  *
+ * more details, a copy of which can be found in the file COPYING  *
+ * included with this package.                                     *
  *******************************************************************/
 
-/*
- * $Id: lpfc_disc.h 1.61 2005/04/07 08:46:52EDT sf_support Exp  $
- */
-
 #define FC_MAX_HOLD_RSCN     32	      /* max number of deferred RSCNs */
-#define FC_MAX_NS_RSP        65536    /* max size NameServer rsp */
+#define FC_MAX_NS_RSP        64512    /* max size NameServer rsp */
 #define FC_MAXLOOP           126      /* max devices supported on a fc loop */
 #define LPFC_DISC_FLOGI_TMO  10	      /* Discovery FLOGI ratov */
 
@@ -32,24 +30,77 @@
  * This is used by Fibre Channel protocol to support FCP.
  */
 
+/* worker thread events */
+enum lpfc_work_type {
+	LPFC_EVT_ONLINE,
+	LPFC_EVT_OFFLINE_PREP,
+	LPFC_EVT_OFFLINE,
+	LPFC_EVT_WARM_START,
+	LPFC_EVT_KILL,
+	LPFC_EVT_ELS_RETRY,
+	LPFC_EVT_DEV_LOSS,
+	LPFC_EVT_FASTPATH_MGMT_EVT,
+	LPFC_EVT_RESET_HBA,
+	LPFC_EVT_RECOVER_PORT
+};
+
 /* structure used to queue event to the discovery tasklet */
 struct lpfc_work_evt {
 	struct list_head      evt_listp;
-	void                * evt_arg1;
-	void                * evt_arg2;
-	uint32_t              evt;
+	void                 *evt_arg1;
+	void                 *evt_arg2;
+	enum lpfc_work_type   evt;
 };
 
-#define LPFC_EVT_NODEV_TMO	0x1
-#define LPFC_EVT_ONLINE		0x2
-#define LPFC_EVT_OFFLINE	0x3
-#define LPFC_EVT_ELS_RETRY	0x4
+struct lpfc_scsi_check_condition_event;
+struct lpfc_scsi_varqueuedepth_event;
+struct lpfc_scsi_event_header;
+struct lpfc_fabric_event_header;
+struct lpfc_fcprdchkerr_event;
+
+/* structure used for sending events from fast path */
+struct lpfc_fast_path_event {
+	struct lpfc_work_evt work_evt;
+	struct lpfc_vport     *vport;
+	union {
+		struct lpfc_scsi_check_condition_event check_cond_evt;
+		struct lpfc_scsi_varqueuedepth_event queue_depth_evt;
+		struct lpfc_scsi_event_header scsi_evt;
+		struct lpfc_fabric_event_header fabric_evt;
+		struct lpfc_fcprdchkerr_event read_check_error;
+	} un;
+};
+
+#define LPFC_SLI4_MAX_XRI	1024	/* Used to make the ndlp's xri_bitmap */
+#define XRI_BITMAP_ULONGS (LPFC_SLI4_MAX_XRI / BITS_PER_LONG)
+struct lpfc_node_rrqs {
+	unsigned long xri_bitmap[XRI_BITMAP_ULONGS];
+};
+
+enum lpfc_fc4_xpt_flags {
+	NLP_XPT_REGD		= 0x1,
+	SCSI_XPT_REGD		= 0x2,
+	NVME_XPT_REGD		= 0x4,
+	NVME_XPT_UNREG_WAIT	= 0x8,
+	NLP_XPT_HAS_HH		= 0x10
+};
+
+enum lpfc_nlp_save_flags {
+	/* devloss occurred during recovery */
+	NLP_IN_RECOV_POST_DEV_LOSS	= 0x1,
+	/* wait for outstanding LOGO to cmpl */
+	NLP_WAIT_FOR_LOGO		= 0x2,
+};
 
 struct lpfc_nodelist {
 	struct list_head nlp_listp;
-	struct lpfc_name nlp_portname;		/* port name */
-	struct lpfc_name nlp_nodename;		/* node name */
-	uint32_t         nlp_flag;		/* entry  flags */
+	struct serv_parm fc_sparam;		/* buffer for service params */
+	struct lpfc_name nlp_portname;
+	struct lpfc_name nlp_nodename;
+
+	spinlock_t	lock;			/* Node management lock */
+
+	uint32_t         nlp_flag;		/* entry flags */
 	uint32_t         nlp_DID;		/* FC D_ID of entry */
 	uint32_t         nlp_last_elscmd;	/* Last ELS cmd sent */
 	uint16_t         nlp_type;
@@ -57,69 +108,104 @@ struct lpfc_nodelist {
 #define NLP_FABRIC         0x4			/* entry rep a Fabric entity */
 #define NLP_FCP_TARGET     0x8			/* entry is an FCP target */
 #define NLP_FCP_INITIATOR  0x10			/* entry is an FCP Initiator */
+#define NLP_NVME_TARGET    0x20			/* entry is a NVME Target */
+#define NLP_NVME_INITIATOR 0x40			/* entry is a NVME Initiator */
+#define NLP_NVME_DISCOVERY 0x80                 /* entry has NVME disc srvc */
+
+	uint16_t	nlp_fc4_type;		/* FC types node supports. */
+						/* Assigned from GID_FF, only
+						 * FCP (0x8) and NVME (0x28)
+						 * supported.
+						 */
+#define NLP_FC4_NONE	0x0
+#define NLP_FC4_FCP	0x1			/* FC4 Type FCP (value x8)) */
+#define NLP_FC4_NVME	0x2			/* FC4 TYPE NVME (value x28) */
 
 	uint16_t        nlp_rpi;
 	uint16_t        nlp_state;		/* state transition indicator */
+	uint16_t        nlp_prev_state;		/* state transition indicator */
 	uint16_t        nlp_xri;		/* output exchange id for RPI */
 	uint16_t        nlp_sid;		/* scsi id */
 #define NLP_NO_SID		0xffff
 	uint16_t	nlp_maxframe;		/* Max RCV frame size */
 	uint8_t		nlp_class_sup;		/* Supported Classes */
 	uint8_t         nlp_retry;		/* used for ELS retries */
-	uint8_t         nlp_disc_refcnt;	/* used for DSM */
 	uint8_t         nlp_fcp_info;	        /* class info, bits 0-3 */
 #define NLP_FCP_2_DEVICE   0x10			/* FCP-2 device */
+	u8		nlp_nvme_info;	        /* NVME NSLER Support */
+	uint8_t		vmid_support;		/* destination VMID support */
+#define NLP_NVME_NSLER     0x1			/* NVME NSLER device */
 
 	struct timer_list   nlp_delayfunc;	/* Used for delayed ELS cmds */
-	struct timer_list   nlp_tmofunc;	/* Used for nodev tmo */
-	struct fc_rport *rport;			/* Corresponding FC transport
-						   port structure */
-	struct lpfc_nodelist *nlp_rpi_hash_next;
-	struct lpfc_hba      *nlp_phba;
-	struct lpfc_work_evt nodev_timeout_evt;
+	struct lpfc_hba *phba;
+	struct fc_rport *rport;		/* scsi_transport_fc port structure */
+	struct lpfc_nvme_rport *nrport;	/* nvme transport rport struct. */
+	struct lpfc_vport *vport;
 	struct lpfc_work_evt els_retry_evt;
+	struct lpfc_work_evt dev_loss_evt;
+	struct lpfc_work_evt recovery_evt;
+	struct kref     kref;
+	atomic_t cmd_pending;
+	uint32_t cmd_qdepth;
+	unsigned long last_change_time;
+	unsigned long *active_rrqs_xri_bitmap;
+	uint32_t fc4_prli_sent;
+
+	/* flags to keep ndlp alive until special conditions are met */
+	enum lpfc_nlp_save_flags save_flags;
+
+	enum lpfc_fc4_xpt_flags fc4_xpt_flags;
+
+	uint32_t nvme_fb_size; /* NVME target's supported byte cnt */
+#define NVME_FB_BIT_SHIFT 9    /* PRLI Rsp first burst in 512B units. */
+	uint32_t nlp_defer_did;
+	wait_queue_head_t *logo_waitq;
 };
 
-/* Defines for nlp_flag (uint32) */
-#define NLP_NO_LIST        0x0		/* Indicates immediately free node */
-#define NLP_UNUSED_LIST    0x1		/* Flg to indicate node will be freed */
-#define NLP_PLOGI_LIST     0x2		/* Flg to indicate sent PLOGI */
-#define NLP_ADISC_LIST     0x3		/* Flg to indicate sent ADISC */
-#define NLP_REGLOGIN_LIST  0x4		/* Flg to indicate sent REG_LOGIN */
-#define NLP_PRLI_LIST      0x5		/* Flg to indicate sent PRLI */
-#define NLP_UNMAPPED_LIST  0x6		/* Node is now unmapped */
-#define NLP_MAPPED_LIST    0x7		/* Node is now mapped */
-#define NLP_NPR_LIST       0x8		/* Node is in NPort Recovery state */
-#define NLP_JUST_DQ        0x9		/* just deque ndlp in lpfc_nlp_list */
-#define NLP_LIST_MASK      0xf		/* mask to see what list node is on */
-#define NLP_PLOGI_SND      0x20		/* sent PLOGI request for this entry */
-#define NLP_PRLI_SND       0x40		/* sent PRLI request for this entry */
-#define NLP_ADISC_SND      0x80		/* sent ADISC request for this entry */
-#define NLP_LOGO_SND       0x100	/* sent LOGO request for this entry */
-#define NLP_RNID_SND       0x400	/* sent RNID request for this entry */
-#define NLP_ELS_SND_MASK   0x7e0	/* sent ELS request for this entry */
-#define NLP_NODEV_TMO      0x10000	/* nodev timeout is running for node */
-#define NLP_DELAY_TMO      0x20000	/* delay timeout is running for node */
-#define NLP_NPR_2B_DISC    0x40000	/* node is included in num_disc_nodes */
-#define NLP_RCV_PLOGI      0x80000	/* Rcv'ed PLOGI from remote system */
-#define NLP_LOGO_ACC       0x100000	/* Process LOGO after ACC completes */
-#define NLP_TGT_NO_SCSIID  0x200000	/* good PRLI but no binding for scsid */
-#define NLP_ACC_REGLOGIN   0x1000000	/* Issue Reg Login after successful
-					   ACC */
-#define NLP_NPR_ADISC      0x2000000	/* Issue ADISC when dq'ed from
-					   NPR list */
-#define NLP_DELAY_REMOVE   0x4000000	/* Defer removal till end of DSM */
+struct lpfc_node_rrq {
+	struct list_head list;
+	uint16_t xritag;
+	uint16_t send_rrq;
+	uint16_t rxid;
+	uint32_t         nlp_DID;		/* FC D_ID of entry */
+	struct lpfc_vport *vport;
+	unsigned long rrq_stop_time;
+};
 
-/* Defines for list searchs */
-#define NLP_SEARCH_MAPPED    0x1	/* search mapped */
-#define NLP_SEARCH_UNMAPPED  0x2	/* search unmapped */
-#define NLP_SEARCH_PLOGI     0x4	/* search plogi */
-#define NLP_SEARCH_ADISC     0x8	/* search adisc */
-#define NLP_SEARCH_REGLOGIN  0x10	/* search reglogin */
-#define NLP_SEARCH_PRLI      0x20	/* search prli */
-#define NLP_SEARCH_NPR       0x40	/* search npr */
-#define NLP_SEARCH_UNUSED    0x80	/* search mapped */
-#define NLP_SEARCH_ALL       0xff	/* search all lists */
+#define lpfc_ndlp_check_qdepth(phba, ndlp) \
+	(ndlp->cmd_qdepth < phba->sli4_hba.max_cfg_param.max_xri)
+
+/* Defines for nlp_flag (uint32) */
+#define NLP_IGNR_REG_CMPL  0x00000001 /* Rcvd rscn before we cmpl reg login */
+#define NLP_REG_LOGIN_SEND 0x00000002   /* sent reglogin to adapter */
+#define NLP_RELEASE_RPI    0x00000004   /* Release RPI to free pool */
+#define NLP_SUPPRESS_RSP   0x00000010	/* Remote NPort supports suppress rsp */
+#define NLP_PLOGI_SND      0x00000020	/* sent PLOGI request for this entry */
+#define NLP_PRLI_SND       0x00000040	/* sent PRLI request for this entry */
+#define NLP_ADISC_SND      0x00000080	/* sent ADISC request for this entry */
+#define NLP_LOGO_SND       0x00000100	/* sent LOGO request for this entry */
+#define NLP_RNID_SND       0x00000400	/* sent RNID request for this entry */
+#define NLP_ELS_SND_MASK   0x000007e0	/* sent ELS request for this entry */
+#define NLP_NVMET_RECOV    0x00001000   /* NVMET auditing node for recovery. */
+#define NLP_UNREG_INP      0x00008000	/* UNREG_RPI cmd is in progress */
+#define NLP_DROPPED        0x00010000	/* Init ref count has been dropped */
+#define NLP_DELAY_TMO      0x00020000	/* delay timeout is running for node */
+#define NLP_NPR_2B_DISC    0x00040000	/* node is included in num_disc_nodes */
+#define NLP_RCV_PLOGI      0x00080000	/* Rcv'ed PLOGI from remote system */
+#define NLP_LOGO_ACC       0x00100000	/* Process LOGO after ACC completes */
+#define NLP_TGT_NO_SCSIID  0x00200000	/* good PRLI but no binding for scsid */
+#define NLP_ISSUE_LOGO     0x00400000	/* waiting to issue a LOGO */
+#define NLP_IN_DEV_LOSS    0x00800000	/* devloss in progress */
+#define NLP_ACC_REGLOGIN   0x01000000	/* Issue Reg Login after successful
+					   ACC */
+#define NLP_NPR_ADISC      0x02000000	/* Issue ADISC when dq'ed from
+					   NPR list */
+#define NLP_RM_DFLT_RPI    0x04000000	/* need to remove leftover dflt RPI */
+#define NLP_NODEV_REMOVE   0x08000000	/* Defer removal till discovery ends */
+#define NLP_TARGET_REMOVE  0x10000000   /* Target remove in process */
+#define NLP_SC_REQ         0x20000000	/* Target requires authentication */
+#define NLP_FIRSTBURST     0x40000000	/* Target supports FirstBurst */
+#define NLP_RPI_REGISTERED 0x80000000	/* nlp_rpi is valid */
 
 /* There are 4 different double linked lists nodelist entries can reside on.
  * The Port Login (PLOGI) list and Address Discovery (ADISC) list are used
@@ -142,10 +228,11 @@ struct lpfc_nodelist {
 #define NLP_STE_ADISC_ISSUE       0x2	/* ADISC was sent to NL_PORT */
 #define NLP_STE_REG_LOGIN_ISSUE   0x3	/* REG_LOGIN was issued for NL_PORT */
 #define NLP_STE_PRLI_ISSUE        0x4	/* PRLI was sent to NL_PORT */
-#define NLP_STE_UNMAPPED_NODE     0x5	/* PRLI completed from NL_PORT */
-#define NLP_STE_MAPPED_NODE       0x6	/* Identified as a FCP Target */
-#define NLP_STE_NPR_NODE          0x7	/* NPort disappeared */
-#define NLP_STE_MAX_STATE         0x8
+#define NLP_STE_LOGO_ISSUE	  0x5	/* LOGO was sent to NL_PORT */
+#define NLP_STE_UNMAPPED_NODE     0x6	/* PRLI completed from NL_PORT */
+#define NLP_STE_MAPPED_NODE       0x7	/* Identified as a FCP Target */
+#define NLP_STE_NPR_NODE          0x8	/* NPort disappeared */
+#define NLP_STE_MAX_STATE         0x9
 #define NLP_STE_FREED_NODE        0xff	/* node entry was freed to MEM_NLP */
 
 /* For UNUSED_NODE state, the node has just been allocated.
@@ -164,7 +251,7 @@ struct lpfc_nodelist {
  */
 /*
  * For a Link Down, all nodes on the ADISC, PLOGI, unmapped or mapped
- * lists will receive a DEVICE_RECOVERY event. If the linkdown or nodev timers
+ * lists will receive a DEVICE_RECOVERY event. If the linkdown or devloss timers
  * expire, all effected nodes will receive a DEVICE_RM event.
  */
 /*
@@ -203,4 +290,4 @@ struct lpfc_nodelist {
 #define NLP_EVT_DEVICE_RM         0xb	/* Device not found in NS / ALPAmap */
 #define NLP_EVT_DEVICE_RECOVERY   0xc	/* Device existence unknown */
 #define NLP_EVT_MAX_EVENT         0xd
-
+#define NLP_EVT_NOTHING_PENDING   0xff

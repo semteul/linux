@@ -1,69 +1,46 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *    Chassis LCD/LED driver for HP-PARISC workstations
+ *	Chassis LCD/LED driver for HP-PARISC workstations
  *
- *      (c) Copyright 2000 Red Hat Software
- *      (c) Copyright 2000 Helge Deller <hdeller@redhat.com>
- *      (c) Copyright 2001-2004 Helge Deller <deller@gmx.de>
- *      (c) Copyright 2001 Randolph Chung <tausq@debian.org>
+ *	(c) Copyright 2000 Red Hat Software
+ *	(c) Copyright 2000 Helge Deller <hdeller@redhat.com>
+ *	(c) Copyright 2001 Randolph Chung <tausq@debian.org>
+ *	(c) Copyright 2000-2023 Helge Deller <deller@gmx.de>
  *
- *      This program is free software; you can redistribute it and/or modify
- *      it under the terms of the GNU General Public License as published by
- *      the Free Software Foundation; either version 2 of the License, or
- *      (at your option) any later version.
+ *	The control of the LEDs and LCDs on PARISC machines has to be done
+ *	completely in software.
  *
- * TODO:
- *	- speed-up calculations with inlined assembler
- *	- interface to write to second row of LCD from /proc (if technically possible)
- *
- * Changes:
- *      - Audit copy_from_user in led_proc_write.
- *                                Daniele Bellucci <bellucda@tiscali.it>
+ *	The LEDs can be configured at runtime in /sys/class/leds/
  */
 
-#include <linux/config.h>
 #include <linux/module.h>
-#include <linux/stddef.h>	/* for offsetof() */
 #include <linux/init.h>
 #include <linux/types.h>
 #include <linux/ioport.h>
 #include <linux/utsname.h>
+#include <linux/capability.h>
 #include <linux/delay.h>
-#include <linux/netdevice.h>
-#include <linux/inetdevice.h>
-#include <linux/in.h>
-#include <linux/interrupt.h>
-#include <linux/kernel_stat.h>
 #include <linux/reboot.h>
-#include <linux/proc_fs.h>
-#include <linux/ctype.h>
-#include <linux/blkdev.h>
+#include <linux/uaccess.h>
+#include <linux/leds.h>
+#include <linux/platform_device.h>
+
 #include <asm/io.h>
 #include <asm/processor.h>
 #include <asm/hardware.h>
 #include <asm/param.h>		/* HZ */
 #include <asm/led.h>
 #include <asm/pdc.h>
-#include <asm/uaccess.h>
 
-/* The control of the LEDs and LCDs on PARISC-machines have to be done 
-   completely in software. The necessary calculations are done in a tasklet
-   which is scheduled at every timer interrupt and since the calculations 
-   may consume relatively much CPU-time some of the calculations can be 
-   turned off with the following variables (controlled via procfs) */
+#define LED_HAS_LCD 1
+#define LED_HAS_LED 2
 
-static int led_type = -1;
-static int led_heartbeat = 1;
-static int led_diskio = 1;
-static int led_lanrxtx = 1;
-static char lcd_text[32];
-static char lcd_text_default[32];
-
-#if 0
-#define DPRINTK(x)	printk x
-#else
-#define DPRINTK(x)
-#endif
-
+static unsigned char led_type;		/* bitmask of LED_HAS_XXX */
+static unsigned char lastleds;		/* LED state from most recent update */
+static unsigned char lcd_new_text;
+static unsigned char lcd_text[20];
+static unsigned char lcd_text_default[20];
+static unsigned char lcd_no_led_support; /* KittyHawk doesn't support LED on its LCD */
 
 struct lcd_block {
 	unsigned char command;	/* stores the command byte      */
@@ -72,7 +49,7 @@ struct lcd_block {
 };
 
 /* Structure returned by PDC_RETURN_CHASSIS_INFO */
-/* NOTE: we use unsigned long:16 two times, since the following member 
+/* NOTE: we use unsigned long:16 two times, since the following member
    lcd_cmd_reg_addr needs to be 64bit aligned on 64bit PA2.0-machines */
 struct pdc_chassis_lcd_info_ret_block {
 	unsigned long model:16;		/* DISPLAY_MODEL_XXXX */
@@ -92,169 +69,82 @@ struct pdc_chassis_lcd_info_ret_block {
 
 
 /* LCD_CMD and LCD_DATA for KittyHawk machines */
-#define KITTYHAWK_LCD_CMD  F_EXTEND(0xf0190000UL) /* 64bit-ready */
-#define KITTYHAWK_LCD_DATA (KITTYHAWK_LCD_CMD+1)
+#define KITTYHAWK_LCD_CMD  F_EXTEND(0xf0190000UL)
+#define KITTYHAWK_LCD_DATA (KITTYHAWK_LCD_CMD + 1)
 
-/* lcd_info is pre-initialized to the values needed to program KittyHawk LCD's 
+/* lcd_info is pre-initialized to the values needed to program KittyHawk LCD's
  * HP seems to have used Sharp/Hitachi HD44780 LCDs most of the time. */
 static struct pdc_chassis_lcd_info_ret_block
-lcd_info __attribute__((aligned(8))) =
+lcd_info __attribute__((aligned(8)))  =
 {
-	.model =		DISPLAY_MODEL_LCD,
+	.model =		DISPLAY_MODEL_NONE,
 	.lcd_width =		16,
 	.lcd_cmd_reg_addr =	KITTYHAWK_LCD_CMD,
 	.lcd_data_reg_addr =	KITTYHAWK_LCD_DATA,
-	.min_cmd_delay =	40,
+	.min_cmd_delay =	80,
 	.reset_cmd1 =		0x80,
 	.reset_cmd2 =		0xc0,
 };
 
-
 /* direct access to some of the lcd_info variables */
-#define LCD_CMD_REG	lcd_info.lcd_cmd_reg_addr	 
-#define LCD_DATA_REG	lcd_info.lcd_data_reg_addr	 
+#define LCD_CMD_REG	lcd_info.lcd_cmd_reg_addr
+#define LCD_DATA_REG	lcd_info.lcd_data_reg_addr
 #define LED_DATA_REG	lcd_info.lcd_cmd_reg_addr	/* LASI & ASP only */
-
 
 /* ptr to LCD/LED-specific function */
 static void (*led_func_ptr) (unsigned char);
 
-#define LED_HASLCD 1
-#define LED_NOLCD  0
-#ifdef CONFIG_PROC_FS
-static int led_proc_read(char *page, char **start, off_t off, int count, 
-	int *eof, void *data)
+
+static void lcd_print_now(void)
 {
-	char *out = page;
-	int len;
+	int i;
+	char *str = lcd_text;
 
-	switch ((long)data)
-	{
-	case LED_NOLCD:
-		out += sprintf(out, "Heartbeat: %d\n", led_heartbeat);
-		out += sprintf(out, "Disk IO: %d\n", led_diskio);
-		out += sprintf(out, "LAN Rx/Tx: %d\n", led_lanrxtx);
-		break;
-	case LED_HASLCD:
-		out += sprintf(out, "%s\n", lcd_text);
-		break;
-	default:
-		*eof = 1;
-		return 0;
-	}
+	if (lcd_info.model != DISPLAY_MODEL_LCD)
+		return;
 
-	len = out - page - off;
-	if (len < count) {
-		*eof = 1;
-		if (len <= 0) return 0;
-	} else {
-		len = count;
+	if (!lcd_new_text)
+		return;
+	lcd_new_text = 0;
+
+	/* Set LCD Cursor to 1st character */
+	gsc_writeb(lcd_info.reset_cmd1, LCD_CMD_REG);
+	udelay(lcd_info.min_cmd_delay);
+
+	/* Print the string */
+	for (i = 0; i < lcd_info.lcd_width; i++) {
+		gsc_writeb(*str ? *str++ : ' ', LCD_DATA_REG);
+		udelay(lcd_info.min_cmd_delay);
 	}
-	*start = page + off;
-	return len;
 }
 
-static int led_proc_write(struct file *file, const char *buf, 
-	unsigned long count, void *data)
-{
-	char *cur, lbuf[count + 1];
-	int d;
-
-	if (!capable(CAP_SYS_ADMIN))
-		return -EACCES;
-
-	memset(lbuf, 0, count + 1);
-
-	if (copy_from_user(lbuf, buf, count))
-		return -EFAULT;
-
-	cur = lbuf;
-
-	/* skip initial spaces */
-	while (*cur && isspace(*cur))
-	{
-		cur++;
-	}
-
-	switch ((long)data)
-	{
-	case LED_NOLCD:
-		d = *cur++ - '0';
-		if (d != 0 && d != 1) goto parse_error;
-		led_heartbeat = d;
-
-		if (*cur++ != ' ') goto parse_error;
-
-		d = *cur++ - '0';
-		if (d != 0 && d != 1) goto parse_error;
-		led_diskio = d;
-
-		if (*cur++ != ' ') goto parse_error;
-
-		d = *cur++ - '0';
-		if (d != 0 && d != 1) goto parse_error;
-		led_lanrxtx = d;
-
-		break;
-	case LED_HASLCD:
-		if (*cur && cur[strlen(cur)-1] == '\n')
-			cur[strlen(cur)-1] = 0;
-		if (*cur == 0) 
-			cur = lcd_text_default;
-		lcd_print(cur);
-		break;
-	default:
-		return 0;
-	}
-	
-	return count;
-
-parse_error:
-	if ((long)data == LED_NOLCD)
-		printk(KERN_CRIT "Parse error: expect \"n n n\" (n == 0 or 1) for heartbeat,\ndisk io and lan tx/rx indicators\n");
-	return -EINVAL;
-}
-
-static int __init led_create_procfs(void)
-{
-	struct proc_dir_entry *proc_pdc_root = NULL;
-	struct proc_dir_entry *ent;
-
-	if (led_type == -1) return -1;
-
-	proc_pdc_root = proc_mkdir("pdc", 0);
-	if (!proc_pdc_root) return -1;
-	proc_pdc_root->owner = THIS_MODULE;
-	ent = create_proc_entry("led", S_IFREG|S_IRUGO|S_IWUSR, proc_pdc_root);
-	if (!ent) return -1;
-	ent->nlink = 1;
-	ent->data = (void *)LED_NOLCD; /* LED */
-	ent->read_proc = led_proc_read;
-	ent->write_proc = led_proc_write;
-	ent->owner = THIS_MODULE;
-
-	if (led_type == LED_HASLCD)
-	{
-		ent = create_proc_entry("lcd", S_IFREG|S_IRUGO|S_IWUSR, proc_pdc_root);
-		if (!ent) return -1;
-		ent->nlink = 1;
-		ent->data = (void *)LED_HASLCD; /* LCD */
-		ent->read_proc = led_proc_read;
-		ent->write_proc = led_proc_write;
-		ent->owner = THIS_MODULE;
-	}
-
-	return 0;
-}
-#endif
-
-/*
-   ** 
-   ** led_ASP_driver()
-   ** 
+/**
+ *	lcd_print()
+ *
+ *	@str: string to show on the LCD. If NULL, print current string again.
+ *
+ *	Displays the given string on the LCD-Display of newer machines.
  */
+void lcd_print(const char *str)
+{
+	/* copy display string to buffer for procfs */
+	if (str)
+		strscpy(lcd_text, str, sizeof(lcd_text));
+	lcd_new_text = 1;
+
+	/* print now if LCD without any LEDs */
+	if (led_type == LED_HAS_LCD)
+		lcd_print_now();
+}
+
 #define	LED_DATA	0x01	/* data to shift (0:on 1:off) */
 #define	LED_STROBE	0x02	/* strobe to clock data */
+
+/**
+ *	led_ASP_driver() - LED driver for the ASP controller chip
+ *
+ *	@leds: bitmap representing the LED status
+ */
 static void led_ASP_driver(unsigned char leds)
 {
 	int i;
@@ -269,11 +159,10 @@ static void led_ASP_driver(unsigned char leds)
 	}
 }
 
-
-/*
-   ** 
-   ** led_LASI_driver()
-   ** 
+/**
+ *	led_LASI_driver() - LED driver for the LASI controller chip
+ *
+ *	@leds: bitmap representing the LED status
  */
 static void led_LASI_driver(unsigned char leds)
 {
@@ -281,234 +170,57 @@ static void led_LASI_driver(unsigned char leds)
 	gsc_writeb( leds, LED_DATA_REG );
 }
 
-
-/*
-   ** 
-   ** led_LCD_driver()
-   ** 
-   ** The logic of the LCD driver is, that we write at every scheduled call
-   ** only to one of LCD_CMD_REG _or_ LCD_DATA_REG - registers.
-   ** That way we don't need to let this tasklet busywait for min_cmd_delay
-   ** milliseconds.
-   **
-   ** TODO: check the value of "min_cmd_delay" against the value of HZ.
-   **   
+/**
+ *	led_LCD_driver() - LED & LCD driver for LCD chips
+ *
+ *	@leds: bitmap representing the LED status
  */
 static void led_LCD_driver(unsigned char leds)
 {
-	static int last_index;	/* 0:heartbeat, 1:disk, 2:lan_in, 3:lan_out */
-	static int last_was_cmd;/* 0: CMD was written last, 1: DATA was last */
-	struct lcd_block *block_ptr;
-	int value;
+	static const unsigned char mask[4] = {
+		LED_HEARTBEAT, LED_DISK_IO,
+		LED_LAN_RCV, LED_LAN_TX };
 
-	switch (last_index) {
-	    case 0:	block_ptr = &lcd_info.heartbeat;
-			value = leds & LED_HEARTBEAT;
-			break;
-	    case 1:	block_ptr = &lcd_info.disk_io;
-			value = leds & LED_DISK_IO;
-			break;					
-	    case 2:	block_ptr = &lcd_info.lan_rcv;
-			value = leds & LED_LAN_RCV;
-			break;					
-	    case 3:	block_ptr = &lcd_info.lan_tx;
-			value = leds & LED_LAN_TX;
-			break;
-	    default:	/* should never happen: */
-			return;
-	}
+	static struct lcd_block * const blockp[4] = {
+		&lcd_info.heartbeat,
+		&lcd_info.disk_io,
+		&lcd_info.lan_rcv,
+		&lcd_info.lan_tx
+	};
+	static unsigned char latest_leds;
+	int i;
 
-	if (last_was_cmd) {
-	    /* write the value to the LCD data port */
-    	    gsc_writeb( value ? block_ptr->on : block_ptr->off, LCD_DATA_REG );
-	} else {
-	    /* write the command-byte to the LCD command register */
-    	    gsc_writeb( block_ptr->command, LCD_CMD_REG );
-	}    
-	
-	/* now update the vars for the next interrupt iteration */ 
-	if (++last_was_cmd == 2) { /* switch between cmd & data */
-	    last_was_cmd = 0;
-	    if (++last_index == 4) 
-		last_index = 0;	 /* switch back to heartbeat index */
+	for (i = 0; i < 4; ++i) {
+		if ((leds & mask[i]) == (latest_leds & mask[i]))
+			continue;
+
+		gsc_writeb( blockp[i]->command, LCD_CMD_REG );
+		udelay(lcd_info.min_cmd_delay);
+
+		gsc_writeb( leds & mask[i] ? blockp[i]->on :
+				blockp[i]->off, LCD_DATA_REG );
+		udelay(lcd_info.min_cmd_delay);
 	}
+	latest_leds = leds;
+
+	lcd_print_now();
 }
 
 
-/*
-   ** 
-   ** led_get_net_activity()
-   ** 
-   ** calculate if there was TX- or RX-troughput on the network interfaces
-   ** (analog to dev_get_info() from net/core/dev.c)
-   **   
+/**
+ *	lcd_system_halt()
+ *
+ *	@nb: pointer to the notifier_block structure
+ *	@event: the event (SYS_RESTART, SYS_HALT or SYS_POWER_OFF)
+ *	@buf: pointer to a buffer (not used)
+ *
+ *	Called by the reboot notifier chain at shutdown. Stops all
+ *	LED/LCD activities.
  */
-static __inline__ int led_get_net_activity(void)
-{ 
-#ifndef CONFIG_NET
-	return 0;
-#else
-	static unsigned long rx_total_last, tx_total_last;
-	unsigned long rx_total, tx_total;
-	struct net_device *dev;
-	int retval;
-
-	rx_total = tx_total = 0;
-	
-	/* we are running as tasklet, so locking dev_base 
-	 * for reading should be OK */
-	read_lock(&dev_base_lock);
-	for (dev = dev_base; dev; dev = dev->next) {
-	    struct net_device_stats *stats;
-	    struct in_device *in_dev = __in_dev_get(dev);
-	    if (!in_dev || !in_dev->ifa_list)
-		continue;
-	    if (LOOPBACK(in_dev->ifa_list->ifa_local))
-		continue;
-	    if (!dev->get_stats) 
-		continue;
-	    stats = dev->get_stats(dev);
-	    rx_total += stats->rx_packets;
-	    tx_total += stats->tx_packets;
-	}
-	read_unlock(&dev_base_lock);
-
-	retval = 0;
-
-	if (rx_total != rx_total_last) {
-		rx_total_last = rx_total;
-		retval |= LED_LAN_RCV;
-	}
-
-	if (tx_total != tx_total_last) {
-		tx_total_last = tx_total;
-		retval |= LED_LAN_TX;
-	}
-
-	return retval;
-#endif
-}
-
-
-/*
-   ** 
-   ** led_get_diskio_activity()
-   ** 
-   ** calculate if there was disk-io in the system
-   **   
- */
-static __inline__ int led_get_diskio_activity(void)
-{	
-	static unsigned long last_pgpgin, last_pgpgout;
-	struct page_state pgstat;
-	int changed;
-	
-	get_full_page_state(&pgstat); /* get no of sectors in & out */
-
-	/* Just use a very simple calculation here. Do not care about overflow,
-	   since we only want to know if there was activity or not. */
-	changed = (pgstat.pgpgin != last_pgpgin) || (pgstat.pgpgout != last_pgpgout);
-	last_pgpgin  = pgstat.pgpgin;
-	last_pgpgout = pgstat.pgpgout;
-	
-	return (changed ? LED_DISK_IO : 0);
-}
-
-
-
-/*
-   ** led_tasklet_func()
-   ** 
-   ** is scheduled at every timer interrupt from time.c and
-   ** updates the chassis LCD/LED 
-
-    TODO:
-    - display load average (older machines like 715/64 have 4 "free" LED's for that)
-    - optimizations
- */
-
-#define HEARTBEAT_LEN (HZ*6/100)
-#define HEARTBEAT_2ND_RANGE_START (HZ*22/100)
-#define HEARTBEAT_2ND_RANGE_END   (HEARTBEAT_2ND_RANGE_START + HEARTBEAT_LEN)
-
-#define NORMALIZED_COUNT(count) (count/(HZ/100))
-
-static void led_tasklet_func(unsigned long unused)
+static int lcd_system_halt(struct notifier_block *nb, unsigned long event, void *buf)
 {
-	static unsigned char lastleds;
-	unsigned char currentleds; /* stores current value of the LEDs */
-	static unsigned long count; /* static incremented value, not wrapped */
-	static unsigned long count_HZ; /* counter in range 0..HZ */
+	const char *txt;
 
-	/* exit if not initialized */
-	if (!led_func_ptr)
-	    return;
-
-	/* increment the local counters */
-	++count;
-	if (++count_HZ == HZ)
-	    count_HZ = 0;
-
-	currentleds = lastleds;
-
-	if (led_heartbeat)
-	{
-		/* flash heartbeat-LED like a real heart (2 x short then a long delay) */
-		if (count_HZ<HEARTBEAT_LEN || 
-		    (count_HZ>=HEARTBEAT_2ND_RANGE_START && count_HZ<HEARTBEAT_2ND_RANGE_END)) 
-		    currentleds |= LED_HEARTBEAT;
-		else
-		    currentleds &= ~LED_HEARTBEAT;
-	}
-
-	/* look for network activity and flash LEDs respectively */
-	if (led_lanrxtx && ((NORMALIZED_COUNT(count)+(8/2)) & 7) == 0)
-	{
-		currentleds &= ~(LED_LAN_RCV | LED_LAN_TX);
-		currentleds |= led_get_net_activity();
-	}
-
-	/* avoid to calculate diskio-stats at same irq  as netio-stats */
-	if (led_diskio && (NORMALIZED_COUNT(count) & 7) == 0)
-	{
-		currentleds &= ~LED_DISK_IO;
-		currentleds |= led_get_diskio_activity();
-	}
-
-	/* blink all LEDs twice a second if we got an Oops (HPMC) */
-	if (oops_in_progress) {
-		currentleds = (count_HZ<=(HZ/2)) ? 0 : 0xff;
-	}
-	
-	/* update the LCD/LEDs */
-	if (currentleds != lastleds) {
-	    led_func_ptr(currentleds);
-	    lastleds = currentleds;
-	}
-}
-
-/* main led tasklet struct (scheduled from time.c) */
-DECLARE_TASKLET_DISABLED(led_tasklet, led_tasklet_func, 0);
-
-
-/*
-   ** led_halt()
-   ** 
-   ** called by the reboot notifier chain at shutdown and stops all
-   ** LED/LCD activities.
-   ** 
- */
-
-static int led_halt(struct notifier_block *, unsigned long, void *);
-
-static struct notifier_block led_notifier = {
-	.notifier_call = led_halt,
-};
-
-static int led_halt(struct notifier_block *nb, unsigned long event, void *buf) 
-{
-	char *txt;
-	
 	switch (event) {
 	case SYS_RESTART:	txt = "SYSTEM RESTART";
 				break;
@@ -518,92 +230,306 @@ static int led_halt(struct notifier_block *nb, unsigned long event, void *buf)
 				break;
 	default:		return NOTIFY_DONE;
 	}
-	
-	/* completely stop the LED/LCD tasklet */
-	tasklet_disable(&led_tasklet);
 
-	if (lcd_info.model == DISPLAY_MODEL_LCD)
-		lcd_print(txt);
-	else
-		if (led_func_ptr)
-			led_func_ptr(0xff); /* turn all LEDs ON */
-	
-	unregister_reboot_notifier(&led_notifier);
+	lcd_print(txt);
+
 	return NOTIFY_OK;
 }
 
-/*
-   ** register_led_driver()
-   ** 
-   ** registers an external LED or LCD for usage by this driver.
-   ** currently only LCD-, LASI- and ASP-style LCD/LED's are supported.
-   ** 
- */
+static struct notifier_block lcd_system_halt_notifier = {
+	.notifier_call = lcd_system_halt,
+};
 
+static void set_led(struct led_classdev *led_cdev, enum led_brightness brightness);
+
+struct hppa_led {
+	struct led_classdev	led_cdev;
+	unsigned char		led_bit;
+};
+#define to_hppa_led(d) container_of(d, struct hppa_led, led_cdev)
+
+typedef void (*set_handler)(struct led_classdev *, enum led_brightness);
+struct led_type {
+	const char	*name;
+	set_handler	handler;
+	const char	*default_trigger;
+};
+
+#define NUM_LEDS_PER_BOARD	8
+struct hppa_drvdata {
+	struct hppa_led	leds[NUM_LEDS_PER_BOARD];
+};
+
+static void set_led(struct led_classdev *led_cdev, enum led_brightness brightness)
+{
+	struct hppa_led *p = to_hppa_led(led_cdev);
+	unsigned char led_bit = p->led_bit;
+
+	if (brightness == LED_OFF)
+		lastleds &= ~led_bit;
+	else
+		lastleds |= led_bit;
+
+	if (led_func_ptr)
+		led_func_ptr(lastleds);
+}
+
+
+static int hppa_led_generic_probe(struct platform_device *pdev,
+				  struct led_type *types)
+{
+	struct hppa_drvdata *p;
+	int i, err;
+
+	p = devm_kzalloc(&pdev->dev, sizeof(*p), GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	for (i = 0; i < NUM_LEDS_PER_BOARD; i++) {
+		struct led_classdev *lp = &p->leds[i].led_cdev;
+
+		p->leds[i].led_bit = BIT(i);
+		lp->name = types[i].name;
+		lp->brightness = LED_FULL;
+		lp->brightness_set = types[i].handler;
+		lp->default_trigger = types[i].default_trigger;
+		err = led_classdev_register(&pdev->dev, lp);
+		if (err) {
+			dev_err(&pdev->dev, "Could not register %s LED\n",
+			       lp->name);
+			for (i--; i >= 0; i--)
+				led_classdev_unregister(&p->leds[i].led_cdev);
+			return err;
+		}
+	}
+
+	platform_set_drvdata(pdev, p);
+
+	return 0;
+}
+
+static void platform_led_remove(struct platform_device *pdev)
+{
+	struct hppa_drvdata *p = platform_get_drvdata(pdev);
+	int i;
+
+	for (i = 0; i < NUM_LEDS_PER_BOARD; i++)
+		led_classdev_unregister(&p->leds[i].led_cdev);
+}
+
+static struct led_type mainboard_led_types[NUM_LEDS_PER_BOARD] = {
+	{
+		.name		= "platform-lan-tx",
+		.handler	= set_led,
+		.default_trigger = "tx",
+	},
+	{
+		.name		= "platform-lan-rx",
+		.handler	= set_led,
+		.default_trigger = "rx",
+	},
+	{
+		.name		= "platform-disk",
+		.handler	= set_led,
+		.default_trigger = "disk-activity",
+	},
+	{
+		.name		= "platform-heartbeat",
+		.handler	= set_led,
+		.default_trigger = "heartbeat",
+	},
+	{
+		.name		= "platform-LED4",
+		.handler	= set_led,
+		.default_trigger = "panic",
+	},
+	{
+		.name		= "platform-LED5",
+		.handler	= set_led,
+		.default_trigger = "panic",
+	},
+	{
+		.name		= "platform-LED6",
+		.handler	= set_led,
+		.default_trigger = "panic",
+	},
+	{
+		.name		= "platform-LED7",
+		.handler	= set_led,
+		.default_trigger = "panic",
+	},
+};
+
+static int platform_led_probe(struct platform_device *pdev)
+{
+	return hppa_led_generic_probe(pdev, mainboard_led_types);
+}
+
+MODULE_ALIAS("platform:platform-leds");
+
+static struct platform_driver hppa_mainboard_led_driver = {
+	.probe		= platform_led_probe,
+	.remove_new	= platform_led_remove,
+	.driver		= {
+		.name	= "platform-leds",
+	},
+};
+
+static struct platform_driver * const drivers[] = {
+	&hppa_mainboard_led_driver,
+};
+
+static struct platform_device platform_leds = {
+	.name = "platform-leds",
+};
+
+/**
+ *	register_led_driver()
+ *
+ *	@model: model type, one of the DISPLAY_MODEL_XXXX values
+ *	@cmd_reg: physical address of cmd register for the LED/LCD
+ *	@data_reg: physical address of data register for the LED/LCD
+ *
+ *	Registers a chassis LED or LCD which should be driven by this driver.
+ *	Only PDC-based, LASI- or ASP-style LEDs and LCDs are supported.
+ */
 int __init register_led_driver(int model, unsigned long cmd_reg, unsigned long data_reg)
 {
-	static int initialized;
-	
-	if (initialized || !data_reg)
+	if (led_func_ptr || !data_reg)
 		return 1;
-	
+
+	/* No LEDs when running in QEMU */
+	if (running_on_qemu)
+		return 1;
+
 	lcd_info.model = model;		/* store the values */
 	LCD_CMD_REG = (cmd_reg == LED_CMD_REG_NONE) ? 0 : cmd_reg;
 
 	switch (lcd_info.model) {
 	case DISPLAY_MODEL_LCD:
 		LCD_DATA_REG = data_reg;
-		printk(KERN_INFO "LCD display at %lx,%lx registered\n", 
+		pr_info("led: LCD display at %#lx and %#lx\n",
 			LCD_CMD_REG , LCD_DATA_REG);
 		led_func_ptr = led_LCD_driver;
-		lcd_print( lcd_text_default );
-		led_type = LED_HASLCD;
+		if (lcd_no_led_support)
+			led_type = LED_HAS_LCD;
+		else
+			led_type = LED_HAS_LCD | LED_HAS_LED;
 		break;
 
 	case DISPLAY_MODEL_LASI:
 		LED_DATA_REG = data_reg;
 		led_func_ptr = led_LASI_driver;
-		printk(KERN_INFO "LED display at %lx registered\n", LED_DATA_REG);
-		led_type = LED_NOLCD;
+		pr_info("led: LED display at %#lx\n", LED_DATA_REG);
+		led_type = LED_HAS_LED;
 		break;
 
 	case DISPLAY_MODEL_OLD_ASP:
 		LED_DATA_REG = data_reg;
 		led_func_ptr = led_ASP_driver;
-		printk(KERN_INFO "LED (ASP-style) display at %lx registered\n", 
+		pr_info("led: LED (ASP-style) display at %#lx\n",
 		    LED_DATA_REG);
-		led_type = LED_NOLCD;
+		led_type = LED_HAS_LED;
 		break;
 
 	default:
-		printk(KERN_ERR "%s: Wrong LCD/LED model %d !\n",
-		       __FUNCTION__, lcd_info.model);
+		pr_err("led: Unknown LCD/LED model type %d\n", lcd_info.model);
 		return 1;
 	}
-	
-	/* mark the LCD/LED driver now as initialized and 
-	 * register to the reboot notifier chain */
-	initialized++;
-	register_reboot_notifier(&led_notifier);
 
-	/* start the led tasklet for the first time */
-	tasklet_enable(&led_tasklet);
-	
-	return 0;
+	platform_register_drivers(drivers, ARRAY_SIZE(drivers));
+
+	return register_reboot_notifier(&lcd_system_halt_notifier);
 }
 
-/*
-   ** register_led_regions()
-   ** 
-   ** register_led_regions() registers the LCD/LED regions for /procfs.
-   ** At bootup - where the initialisation of the LCD/LED normally happens - 
-   ** not all internal structures of request_region() are properly set up,
-   ** so that we delay the led-registration until after busdevices_init() 
-   ** has been executed.
-   **
+/**
+ *	early_led_init()
+ *
+ *	early_led_init() is called early in the bootup-process and asks the
+ *	PDC for an usable chassis LCD or LED. If the PDC doesn't return any
+ *	info, then a LED might be detected by the LASI or ASP drivers later.
+ *	KittyHawk machines have often a buggy PDC, so that we explicitly check
+ *	for those machines here.
  */
+static int __init early_led_init(void)
+{
+	struct pdc_chassis_info chassis_info;
+	int ret;
 
-void __init register_led_regions(void)
+	snprintf(lcd_text_default, sizeof(lcd_text_default),
+		"Linux %s", init_utsname()->release);
+	strcpy(lcd_text, lcd_text_default);
+	lcd_new_text = 1;
+
+	/* Work around the buggy PDC of KittyHawk-machines */
+	switch (CPU_HVERSION) {
+	case 0x580:		/* KittyHawk DC2-100 (K100) */
+	case 0x581:		/* KittyHawk DC3-120 (K210) */
+	case 0x582:		/* KittyHawk DC3 100 (K400) */
+	case 0x583:		/* KittyHawk DC3 120 (K410) */
+	case 0x58B:		/* KittyHawk DC2 100 (K200) */
+		pr_info("LCD on KittyHawk-Machine found.\n");
+		lcd_info.model = DISPLAY_MODEL_LCD;
+		/* KittyHawk has no LED support on its LCD, so skip LED detection */
+		lcd_no_led_support = 1;
+		goto found;	/* use the preinitialized values of lcd_info */
+	}
+
+	/* initialize the struct, so that we can check for valid return values */
+	chassis_info.actcnt = chassis_info.maxcnt = 0;
+
+	ret = pdc_chassis_info(&chassis_info, &lcd_info, sizeof(lcd_info));
+	if (ret != PDC_OK) {
+not_found:
+		lcd_info.model = DISPLAY_MODEL_NONE;
+		return 1;
+	}
+
+	/* check the results. Some machines have a buggy PDC */
+	if (chassis_info.actcnt <= 0 || chassis_info.actcnt != chassis_info.maxcnt)
+		goto not_found;
+
+	switch (lcd_info.model) {
+	case DISPLAY_MODEL_LCD:		/* LCD display */
+		if (chassis_info.actcnt <
+			offsetof(struct pdc_chassis_lcd_info_ret_block, _pad)-1)
+			goto not_found;
+		if (!lcd_info.act_enable) {
+			/* PDC tells LCD should not be used. */
+			goto not_found;
+		}
+		break;
+
+	case DISPLAY_MODEL_NONE:	/* no LED or LCD available */
+		goto not_found;
+
+	case DISPLAY_MODEL_LASI:	/* Lasi style 8 bit LED display */
+		if (chassis_info.actcnt != 8 && chassis_info.actcnt != 32)
+			goto not_found;
+		break;
+
+	default:
+		pr_warn("PDC reported unknown LCD/LED model %d\n",
+		       lcd_info.model);
+		goto not_found;
+	}
+
+found:
+	/* register the LCD/LED driver */
+	return register_led_driver(lcd_info.model, LCD_CMD_REG, LCD_DATA_REG);
+}
+arch_initcall(early_led_init);
+
+/**
+ *	register_led_regions()
+ *
+ *	Register_led_regions() registers the LCD/LED regions for /procfs.
+ *	At bootup - where the initialisation of the LCD/LED often happens
+ *	not all internal structures of request_region() are properly set up,
+ *	so that we delay the led-registration until after busdevices_init()
+ *	has been executed.
+ */
+static void __init register_led_regions(void)
 {
 	switch (lcd_info.model) {
 	case DISPLAY_MODEL_LCD:
@@ -617,144 +543,11 @@ void __init register_led_regions(void)
 	}
 }
 
-
-/*
-   ** 
-   ** lcd_print()
-   ** 
-   ** Displays the given string on the LCD-Display of newer machines.
-   ** lcd_print() disables the timer-based led tasklet during its 
-   ** execution and enables it afterwards again.
-   **
- */
-int lcd_print( char *str )
+static int __init startup_leds(void)
 {
-	int i;
-
-	if (!led_func_ptr || lcd_info.model != DISPLAY_MODEL_LCD)
-	    return 0;
-	
-	/* temporarily disable the led tasklet */
-	tasklet_disable(&led_tasklet);
-
-	/* copy display string to buffer for procfs */
-	strlcpy(lcd_text, str, sizeof(lcd_text));
-	
-	/* Set LCD Cursor to 1st character */
-	gsc_writeb(lcd_info.reset_cmd1, LCD_CMD_REG);
-	udelay(lcd_info.min_cmd_delay);
-
-	/* Print the string */
-	for (i=0; i < lcd_info.lcd_width; i++) {
-	    if (str && *str)
-		gsc_writeb(*str++, LCD_DATA_REG);
-	    else
-		gsc_writeb(' ', LCD_DATA_REG);
-	    udelay(lcd_info.min_cmd_delay);
-	}
-	
-	/* re-enable the led tasklet */
-	tasklet_enable(&led_tasklet);
-
-	return lcd_info.lcd_width;
+	if (platform_device_register(&platform_leds))
+                printk(KERN_INFO "LED: failed to register LEDs\n");
+	register_led_regions();
+	return 0;
 }
-
-/*
-   ** led_init()
-   ** 
-   ** led_init() is called very early in the bootup-process from setup.c 
-   ** and asks the PDC for an usable chassis LCD or LED.
-   ** If the PDC doesn't return any info, then the LED
-   ** is detected by lasi.c or asp.c and registered with the
-   ** above functions lasi_led_init() or asp_led_init().
-   ** KittyHawk machines have often a buggy PDC, so that
-   ** we explicitly check for those machines here.
- */
-
-int __init led_init(void)
-{
-	struct pdc_chassis_info chassis_info;
-	int ret;
-
-	snprintf(lcd_text_default, sizeof(lcd_text_default),
-		"Linux %s", system_utsname.release);
-
-	/* Work around the buggy PDC of KittyHawk-machines */
-	switch (CPU_HVERSION) {
-	case 0x580:		/* KittyHawk DC2-100 (K100) */
-	case 0x581:		/* KittyHawk DC3-120 (K210) */
-	case 0x582:		/* KittyHawk DC3 100 (K400) */
-	case 0x583:		/* KittyHawk DC3 120 (K410) */
-	case 0x58B:		/* KittyHawk DC2 100 (K200) */
-		printk(KERN_INFO "%s: KittyHawk-Machine (hversion 0x%x) found, "
-				"LED detection skipped.\n", __FILE__, CPU_HVERSION);
-		goto found;	/* use the preinitialized values of lcd_info */
-	}
-
-	/* initialize the struct, so that we can check for valid return values */
-	lcd_info.model = DISPLAY_MODEL_NONE;
-	chassis_info.actcnt = chassis_info.maxcnt = 0;
-
-	ret = pdc_chassis_info(&chassis_info, &lcd_info, sizeof(lcd_info));
-	if (ret == PDC_OK) {
-		DPRINTK((KERN_INFO "%s: chassis info: model=%d (%s), "
-			 "lcd_width=%d, cmd_delay=%u,\n"
-			 "%s: sizecnt=%d, actcnt=%ld, maxcnt=%ld\n",
-		         __FILE__, lcd_info.model,
-			 (lcd_info.model==DISPLAY_MODEL_LCD) ? "LCD" :
-			  (lcd_info.model==DISPLAY_MODEL_LASI) ? "LED" : "unknown",
-			 lcd_info.lcd_width, lcd_info.min_cmd_delay,
-			 __FILE__, sizeof(lcd_info), 
-			 chassis_info.actcnt, chassis_info.maxcnt));
-		DPRINTK((KERN_INFO "%s: cmd=%p, data=%p, reset1=%x, reset2=%x, act_enable=%d\n",
-			__FILE__, lcd_info.lcd_cmd_reg_addr, 
-			lcd_info.lcd_data_reg_addr, lcd_info.reset_cmd1,  
-			lcd_info.reset_cmd2, lcd_info.act_enable ));
-	
-		/* check the results. Some machines have a buggy PDC */
-		if (chassis_info.actcnt <= 0 || chassis_info.actcnt != chassis_info.maxcnt)
-			goto not_found;
-
-		switch (lcd_info.model) {
-		case DISPLAY_MODEL_LCD:		/* LCD display */
-			if (chassis_info.actcnt < 
-				offsetof(struct pdc_chassis_lcd_info_ret_block, _pad)-1)
-				goto not_found;
-			if (!lcd_info.act_enable) {
-				DPRINTK((KERN_INFO "PDC prohibited usage of the LCD.\n"));
-				goto not_found;
-			}
-			break;
-
-		case DISPLAY_MODEL_NONE:	/* no LED or LCD available */
-			printk(KERN_INFO "PDC reported no LCD or LED.\n");
-			goto not_found;
-
-		case DISPLAY_MODEL_LASI:	/* Lasi style 8 bit LED display */
-			if (chassis_info.actcnt != 8 && chassis_info.actcnt != 32)
-				goto not_found;
-			break;
-
-		default:
-			printk(KERN_WARNING "PDC reported unknown LCD/LED model %d\n",
-			       lcd_info.model);
-			goto not_found;
-		} /* switch() */
-
-found:
-		/* register the LCD/LED driver */
-		register_led_driver(lcd_info.model, LCD_CMD_REG, LCD_DATA_REG);
-		return 0;
-
-	} else { /* if() */
-		DPRINTK((KERN_INFO "pdc_chassis_info call failed with retval = %d\n", ret));
-	}
-
-not_found:
-	lcd_info.model = DISPLAY_MODEL_NONE;
-	return 1;
-}
-
-#ifdef CONFIG_PROC_FS
-module_init(led_create_procfs)
-#endif
+device_initcall(startup_leds);

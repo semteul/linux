@@ -1,93 +1,82 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *  Universal TUN/TAP device driver.
  *  Copyright (C) 1999-2000 Maxim Krasnyansky <max_mk@yahoo.com>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  GNU General Public License for more details.
- *
- *  $Id: if_tun.h,v 1.2 2001/06/01 18:39:47 davem Exp $
  */
-
 #ifndef __IF_TUN_H
 #define __IF_TUN_H
 
-/* Uncomment to enable debugging */
-/* #define TUN_DEBUG 1 */
+#include <uapi/linux/if_tun.h>
+#include <uapi/linux/virtio_net.h>
 
-#ifdef __KERNEL__
+#define TUN_XDP_FLAG 0x1UL
 
-#ifdef TUN_DEBUG
-#define DBG  if(tun->debug)printk
-#define DBG1 if(debug==2)printk
+#define TUN_MSG_UBUF 1
+#define TUN_MSG_PTR  2
+struct tun_msg_ctl {
+	unsigned short type;
+	unsigned short num;
+	void *ptr;
+};
+
+struct tun_xdp_hdr {
+	int buflen;
+	struct virtio_net_hdr gso;
+};
+
+#if defined(CONFIG_TUN) || defined(CONFIG_TUN_MODULE)
+struct socket *tun_get_socket(struct file *);
+struct ptr_ring *tun_get_tx_ring(struct file *file);
+
+static inline bool tun_is_xdp_frame(void *ptr)
+{
+	return (unsigned long)ptr & TUN_XDP_FLAG;
+}
+
+static inline void *tun_xdp_to_ptr(struct xdp_frame *xdp)
+{
+	return (void *)((unsigned long)xdp | TUN_XDP_FLAG);
+}
+
+static inline struct xdp_frame *tun_ptr_to_xdp(void *ptr)
+{
+	return (void *)((unsigned long)ptr & ~TUN_XDP_FLAG);
+}
+
+void tun_ptr_free(void *ptr);
 #else
-#define DBG( a... )
-#define DBG1( a... )
-#endif
+#include <linux/err.h>
+#include <linux/errno.h>
+struct file;
+struct socket;
 
-struct tun_struct {
-	struct list_head        list;
-	unsigned long 		flags;
-	int			attached;
-	uid_t			owner;
+static inline struct socket *tun_get_socket(struct file *f)
+{
+	return ERR_PTR(-EINVAL);
+}
 
-	wait_queue_head_t	read_wait;
-	struct sk_buff_head	readq;
+static inline struct ptr_ring *tun_get_tx_ring(struct file *f)
+{
+	return ERR_PTR(-EINVAL);
+}
 
-	struct net_device	*dev;
-	struct net_device_stats	stats;
+static inline bool tun_is_xdp_frame(void *ptr)
+{
+	return false;
+}
 
-	struct fasync_struct    *fasync;
+static inline void *tun_xdp_to_ptr(struct xdp_frame *xdp)
+{
+	return NULL;
+}
 
-	unsigned long if_flags;
-	u8 dev_addr[ETH_ALEN];
-	u32 chr_filter[2];
-	u32 net_filter[2];
+static inline struct xdp_frame *tun_ptr_to_xdp(void *ptr)
+{
+	return NULL;
+}
 
-#ifdef TUN_DEBUG	
-	int debug;
-#endif  
-};
-
-#endif /* __KERNEL__ */
-
-/* Read queue size */
-#define TUN_READQ_SIZE	500
-
-/* TUN device flags */
-#define TUN_TUN_DEV 	0x0001	
-#define TUN_TAP_DEV	0x0002
-#define TUN_TYPE_MASK   0x000f
-
-#define TUN_FASYNC	0x0010
-#define TUN_NOCHECKSUM	0x0020
-#define TUN_NO_PI	0x0040
-#define TUN_ONE_QUEUE	0x0080
-#define TUN_PERSIST 	0x0100	
-
-/* Ioctl defines */
-#define TUNSETNOCSUM  _IOW('T', 200, int) 
-#define TUNSETDEBUG   _IOW('T', 201, int) 
-#define TUNSETIFF     _IOW('T', 202, int) 
-#define TUNSETPERSIST _IOW('T', 203, int) 
-#define TUNSETOWNER   _IOW('T', 204, int)
-
-/* TUNSETIFF ifr flags */
-#define IFF_TUN		0x0001
-#define IFF_TAP		0x0002
-#define IFF_NO_PI	0x1000
-#define IFF_ONE_QUEUE	0x2000
-
-struct tun_pi {
-	unsigned short flags;
-	unsigned short proto;
-};
-#define TUN_PKT_STRIP	0x0001
-
+static inline void tun_ptr_free(void *ptr)
+{
+}
+#endif /* CONFIG_TUN */
 #endif /* __IF_TUN_H */

@@ -30,9 +30,8 @@
 |		Copyright (C) Motorola, Inc. 1990
 |			All Rights Reserved
 |
-|	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA
-|	The copyright notice above does not evidence any
-|	actual or intended publication of such source code.
+|       For details on the license for this file, please see the
+|       file, README, in this same directory.
 
 |
 |	Modified for Linux-1.3.x by Jes Sorensen (jds@kom.auc.dk)
@@ -40,7 +39,7 @@
 
 #include <linux/linkage.h>
 #include <asm/entry.h>
-#include <asm/offsets.h>
+#include <asm/asm-offsets.h>
 
 |SKELETON	idnt    2,1 | Motorola 040 Floating Point Software Package
 
@@ -381,10 +380,8 @@ fpsp_done:
 .Lnotkern:
 	SAVE_ALL_INT
 	GET_CURRENT(%d0)
-	tstb	%curptr@(TASK_NEEDRESCHED)
-	jne	ret_from_exception	| deliver signals,
-					| reschedule etc..
-	RESTORE_ALL
+	| deliver signals, reschedule etc..
+	jra	ret_from_exception
 
 |
 |	mem_write --- write to user or supervisor address space
@@ -502,12 +499,13 @@ in_ea:
 	dbf	%d0,morein
 	rts
 
-	.section .fixup,#alloc,#execinstr
+	.section .fixup,"ax"
 	.even
 1:
-	jbra	fpsp040_die
+	jbsr	fpsp040_die
+	jbra	.Lnotkern
 
-	.section __ex_table,#alloc
+	.section __ex_table,"a"
 	.align	4
 
 	.long	in_ea,1b

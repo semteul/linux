@@ -1,66 +1,70 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef USBUSX2Y_H
 #define USBUSX2Y_H
 #include "../usbaudio.h"
-#include "usbus428ctldefs.h" 
+#include "../midi.h"
+#include "usbus428ctldefs.h"
 
-#define NRURBS	        2	
+#define NRURBS	        2
 
 
-#define URBS_AsyncSeq 10
-#define URB_DataLen_AsyncSeq 32
-typedef struct {
-	struct urb*	urb[URBS_AsyncSeq];
-	char*   buffer;
-} snd_usX2Y_AsyncSeq_t;
+#define URBS_ASYNC_SEQ 10
+#define URB_DATA_LEN_ASYNC_SEQ 32
+struct snd_usx2y_async_seq {
+	struct urb	*urb[URBS_ASYNC_SEQ];
+	char		*buffer;
+};
 
-typedef struct {
+struct snd_usx2y_urb_seq {
 	int	submitted;
 	int	len;
-	struct urb*	urb[0];
-} snd_usX2Y_urbSeq_t;
+	struct urb	*urb[] __counted_by(len);
+};
 
-typedef struct snd_usX2Y_substream snd_usX2Y_substream_t;
 #include "usx2yhwdeppcm.h"
 
-typedef struct {
-	snd_usb_audio_t 	chip;
+struct usx2ydev {
+	struct usb_device	*dev;
+	int			card_index;
 	int			stride;
-	struct urb		*In04urb;
-	void			*In04Buf;
-	char			In04Last[24];
-	unsigned		In04IntCalls;
-	snd_usX2Y_urbSeq_t	*US04;
-	wait_queue_head_t	In04WaitQueue;
-	snd_usX2Y_AsyncSeq_t	AS04;
+	struct urb		*in04_urb;
+	void			*in04_buf;
+	char			in04_last[24];
+	unsigned int		in04_int_calls;
+	struct snd_usx2y_urb_seq	*us04;
+	wait_queue_head_t	in04_wait_queue;
+	struct snd_usx2y_async_seq	as04;
 	unsigned int		rate,
 				format;
 	int			chip_status;
-	struct semaphore	prepare_mutex;
-	us428ctls_sharedmem_t	*us428ctls_sharedmem;
+	struct mutex		pcm_mutex;
+	struct us428ctls_sharedmem	*us428ctls_sharedmem;
 	int			wait_iso_frame;
 	wait_queue_head_t	us428ctls_wait_queue_head;
-	snd_usX2Y_hwdep_pcm_shm_t	*hwdep_pcm_shm;
-	snd_usX2Y_substream_t	*subs[4];
-	snd_usX2Y_substream_t	* volatile  prepare_subs;
+	struct snd_usx2y_hwdep_pcm_shm	*hwdep_pcm_shm;
+	struct snd_usx2y_substream	*subs[4];
+	struct snd_usx2y_substream	* volatile  prepare_subs;
 	wait_queue_head_t	prepare_wait_queue;
-} usX2Ydev_t;
+	struct list_head	midi_list;
+	int			pcm_devs;
+};
 
 
-struct snd_usX2Y_substream {
-	usX2Ydev_t	*usX2Y;
-	snd_pcm_substream_t *pcm_substream;
+struct snd_usx2y_substream {
+	struct usx2ydev	*usx2y;
+	struct snd_pcm_substream *pcm_substream;
 
-	int			endpoint;		
+	int			endpoint;
 	unsigned int		maxpacksize;		/* max packet size in bytes */
 
 	atomic_t		state;
-#define state_STOPPED	0
-#define state_STARTING1 1
-#define state_STARTING2 2
-#define state_STARTING3 3
-#define state_PREPARED	4
-#define state_PRERUNNING  6
-#define state_RUNNING	8
+#define STATE_STOPPED	0
+#define STATE_STARTING1 1
+#define STATE_STARTING2 2
+#define STATE_STARTING3 3
+#define STATE_PREPARED	4
+#define STATE_PRERUNNING  6
+#define STATE_RUNNING	8
 
 	int			hwptr;			/* free frame position in the buffer (only for playback) */
 	int			hwptr_done;		/* processed frame position in the buffer */
@@ -72,12 +76,12 @@ struct snd_usX2Y_substream {
 };
 
 
-#define usX2Y(c) ((usX2Ydev_t*)(c)->private_data)
+#define usx2y(c) ((struct usx2ydev *)(c)->private_data)
 
-int usX2Y_audio_create(snd_card_t* card);
+int usx2y_audio_create(struct snd_card *card);
 
-int usX2Y_AsyncSeq04_init(usX2Ydev_t* usX2Y);
-int usX2Y_In04_init(usX2Ydev_t* usX2Y);
+int usx2y_async_seq04_init(struct usx2ydev *usx2y);
+int usx2y_in04_init(struct usx2ydev *usx2y);
 
 #define NAME_ALLCAPS "US-X2Y"
 

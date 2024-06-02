@@ -1,55 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  Routines for Gravis UltraSound soundcards
- *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
- *
- *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
+ *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
  */
 
-#include <sound/driver.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/ioport.h>
+#include <linux/module.h>
 #include <sound/core.h>
 #include <sound/gus.h>
 #include <sound/control.h>
 
 #include <asm/dma.h>
 
-MODULE_AUTHOR("Jaroslav Kysela <perex@suse.cz>");
+MODULE_AUTHOR("Jaroslav Kysela <perex@perex.cz>");
 MODULE_DESCRIPTION("Routines for Gravis UltraSound soundcards");
 MODULE_LICENSE("GPL");
 
-static int snd_gus_init_dma_irq(snd_gus_card_t * gus, int latches);
+static int snd_gus_init_dma_irq(struct snd_gus_card * gus, int latches);
 
-int snd_gus_use_inc(snd_gus_card_t * gus)
+int snd_gus_use_inc(struct snd_gus_card * gus)
 {
 	if (!try_module_get(gus->card->module))
 		return 0;
 	return 1;
 }
 
-void snd_gus_use_dec(snd_gus_card_t * gus)
+void snd_gus_use_dec(struct snd_gus_card * gus)
 {
 	module_put(gus->card->module);
 }
 
-static int snd_gus_joystick_info(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t * uinfo)
+static int snd_gus_joystick_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	uinfo->count = 1;
@@ -58,17 +43,17 @@ static int snd_gus_joystick_info(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t *
 	return 0;
 }
 
-static int snd_gus_joystick_get(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
+static int snd_gus_joystick_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
 {
-	snd_gus_card_t *gus = snd_kcontrol_chip(kcontrol);
+	struct snd_gus_card *gus = snd_kcontrol_chip(kcontrol);
 	
 	ucontrol->value.integer.value[0] = gus->joystick_dac & 31;
 	return 0;
 }
 
-static int snd_gus_joystick_put(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
+static int snd_gus_joystick_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
 {
-	snd_gus_card_t *gus = snd_kcontrol_chip(kcontrol);
+	struct snd_gus_card *gus = snd_kcontrol_chip(kcontrol);
 	unsigned long flags;
 	int change;
 	unsigned char nval;
@@ -82,7 +67,7 @@ static int snd_gus_joystick_put(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t 
 	return change;
 }
 
-static snd_kcontrol_new_t snd_gus_joystick_control = {
+static const struct snd_kcontrol_new snd_gus_joystick_control = {
 	.iface = SNDRV_CTL_ELEM_IFACE_CARD,
 	.name = "Joystick Speed",
 	.info = snd_gus_joystick_info,
@@ -90,7 +75,7 @@ static snd_kcontrol_new_t snd_gus_joystick_control = {
 	.put = snd_gus_joystick_put
 };
 
-static void snd_gus_init_control(snd_gus_card_t *gus)
+static void snd_gus_init_control(struct snd_gus_card *gus)
 {
 	if (!gus->ace_flag)
 		snd_ctl_add(gus->card, snd_ctl_new1(&snd_gus_joystick_control, gus));
@@ -100,27 +85,15 @@ static void snd_gus_init_control(snd_gus_card_t *gus)
  *
  */
 
-static int snd_gus_free(snd_gus_card_t *gus)
+static int snd_gus_free(struct snd_gus_card *gus)
 {
 	if (gus->gf1.res_port2 == NULL)
 		goto __hw_end;
-#if defined(CONFIG_SND_SEQUENCER) || (defined(MODULE) && defined(CONFIG_SND_SEQUENCER_MODULE))
-	if (gus->seq_dev) {
-		snd_device_free(gus->card, gus->seq_dev);
-		gus->seq_dev = NULL;
-	}
-#endif
 	snd_gf1_stop(gus);
 	snd_gus_init_dma_irq(gus, 0);
       __hw_end:
-	if (gus->gf1.res_port1) {
-		release_resource(gus->gf1.res_port1);
-		kfree_nocheck(gus->gf1.res_port1);
-	}
-	if (gus->gf1.res_port2) {
-		release_resource(gus->gf1.res_port2);
-		kfree_nocheck(gus->gf1.res_port2);
-	}
+	release_and_free_resource(gus->gf1.res_port1);
+	release_and_free_resource(gus->gf1.res_port2);
 	if (gus->gf1.irq >= 0)
 		free_irq(gus->gf1.irq, (void *) gus);
 	if (gus->gf1.dma1 >= 0) {
@@ -135,31 +108,39 @@ static int snd_gus_free(snd_gus_card_t *gus)
 	return 0;
 }
 
-static int snd_gus_dev_free(snd_device_t *device)
+static int snd_gus_dev_free(struct snd_device *device)
 {
-	snd_gus_card_t *gus = device->device_data;
+	struct snd_gus_card *gus = device->device_data;
 	return snd_gus_free(gus);
 }
 
-int snd_gus_create(snd_card_t * card,
+int snd_gus_create(struct snd_card *card,
 		   unsigned long port,
 		   int irq, int dma1, int dma2,
 		   int timer_dev,
 		   int voices,
 		   int pcm_channels,
 		   int effect,
-		   snd_gus_card_t **rgus)
+		   struct snd_gus_card **rgus)
 {
-	snd_gus_card_t *gus;
+	struct snd_gus_card *gus;
 	int err;
-	static snd_device_ops_t ops = {
+	static const struct snd_device_ops ops = {
 		.dev_free =	snd_gus_dev_free,
 	};
 
 	*rgus = NULL;
-	gus = kcalloc(1, sizeof(*gus), GFP_KERNEL);
+	gus = kzalloc(sizeof(*gus), GFP_KERNEL);
 	if (gus == NULL)
 		return -ENOMEM;
+	spin_lock_init(&gus->reg_lock);
+	spin_lock_init(&gus->voice_alloc);
+	spin_lock_init(&gus->active_voice_lock);
+	spin_lock_init(&gus->event_lock);
+	spin_lock_init(&gus->dma_lock);
+	spin_lock_init(&gus->pcm_volume_level_lock);
+	spin_lock_init(&gus->uart_cmd_lock);
+	mutex_init(&gus->dma_mutex);
 	gus->gf1.irq = -1;
 	gus->gf1.dma1 = -1;
 	gus->gf1.dma2 = -1;
@@ -175,22 +156,25 @@ int snd_gus_create(snd_card_t * card,
 	gus->gf1.reg_timerctrl = GUSP(gus, TIMERCNTRL);
 	gus->gf1.reg_timerdata = GUSP(gus, TIMERDATA);
 	/* allocate resources */
-	if ((gus->gf1.res_port1 = request_region(port, 16, "GUS GF1 (Adlib/SB)")) == NULL) {
+	gus->gf1.res_port1 = request_region(port, 16, "GUS GF1 (Adlib/SB)");
+	if (!gus->gf1.res_port1) {
 		snd_printk(KERN_ERR "gus: can't grab SB port 0x%lx\n", port);
 		snd_gus_free(gus);
 		return -EBUSY;
 	}
-	if ((gus->gf1.res_port2 = request_region(port + 0x100, 12, "GUS GF1 (Synth)")) == NULL) {
+	gus->gf1.res_port2 = request_region(port + 0x100, 12, "GUS GF1 (Synth)");
+	if (!gus->gf1.res_port2) {
 		snd_printk(KERN_ERR "gus: can't grab synth port 0x%lx\n", port + 0x100);
 		snd_gus_free(gus);
 		return -EBUSY;
 	}
-	if (irq >= 0 && request_irq(irq, snd_gus_interrupt, SA_INTERRUPT, "GUS GF1", (void *) gus)) {
+	if (irq >= 0 && request_irq(irq, snd_gus_interrupt, 0, "GUS GF1", (void *) gus)) {
 		snd_printk(KERN_ERR "gus: can't grab irq %d\n", irq);
 		snd_gus_free(gus);
 		return -EBUSY;
 	}
 	gus->gf1.irq = irq;
+	card->sync_irq = irq;
 	if (request_dma(dma1, "GUS - 1")) {
 		snd_printk(KERN_ERR "gus: can't grab DMA1 %d\n", dma1);
 		snd_gus_free(gus);
@@ -224,15 +208,8 @@ int snd_gus_create(snd_card_t * card,
 	gus->gf1.pcm_channels = pcm_channels;
 	gus->gf1.volume_ramp = 25;
 	gus->gf1.smooth_pan = 1;
-	spin_lock_init(&gus->reg_lock);
-	spin_lock_init(&gus->voice_alloc);
-	spin_lock_init(&gus->active_voice_lock);
-	spin_lock_init(&gus->event_lock);
-	spin_lock_init(&gus->dma_lock);
-	spin_lock_init(&gus->pcm_volume_level_lock);
-	spin_lock_init(&gus->uart_cmd_lock);
-	init_MUTEX(&gus->dma_mutex);
-	if ((err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, gus, &ops)) < 0) {
+	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, gus, &ops);
+	if (err < 0) {
 		snd_gus_free(gus);
 		return err;
 	}
@@ -244,7 +221,7 @@ int snd_gus_create(snd_card_t * card,
  *  Memory detection routine for plain GF1 soundcards
  */
 
-static int snd_gus_detect_memory(snd_gus_card_t * gus)
+static int snd_gus_detect_memory(struct snd_gus_card * gus)
 {
 	int l, idx, local;
 	unsigned char d;
@@ -252,7 +229,7 @@ static int snd_gus_detect_memory(snd_gus_card_t * gus)
 	snd_gf1_poke(gus, 0L, 0xaa);
 	snd_gf1_poke(gus, 1L, 0x55);
 	if (snd_gf1_peek(gus, 0L) != 0xaa || snd_gf1_peek(gus, 1L) != 0x55) {
-		snd_printk("plain GF1 card at 0x%lx without onboard DRAM?\n", gus->gf1.port);
+		snd_printk(KERN_ERR "plain GF1 card at 0x%lx without onboard DRAM?\n", gus->gf1.port);
 		return -ENOMEM;
 	}
 	for (idx = 1, d = 0xab; idx < 4; idx++, d++) {
@@ -279,19 +256,21 @@ static int snd_gus_detect_memory(snd_gus_card_t * gus)
 	return 0;		/* some memory were detected */
 }
 
-static int snd_gus_init_dma_irq(snd_gus_card_t * gus, int latches)
+static int snd_gus_init_dma_irq(struct snd_gus_card * gus, int latches)
 {
-	snd_card_t *card;
+	struct snd_card *card;
 	unsigned long flags;
 	int irq, dma1, dma2;
-	static unsigned char irqs[16] =
+	static const unsigned char irqs[16] =
 		{0, 0, 1, 3, 0, 2, 0, 4, 0, 1, 0, 5, 6, 0, 0, 7};
-	static unsigned char dmas[8] =
+	static const unsigned char dmas[8] =
 		{6, 1, 0, 2, 0, 3, 4, 5};
 
-	snd_assert(gus != NULL, return -EINVAL);
+	if (snd_BUG_ON(!gus))
+		return -EINVAL;
 	card = gus->card;
-	snd_assert(card != NULL, return -EINVAL);
+	if (snd_BUG_ON(!card))
+		return -EINVAL;
 
 	gus->mix_cntrl_reg &= 0xf8;
 	gus->mix_cntrl_reg |= 0x01;	/* disable MIC, LINE IN, enable LINE OUT */
@@ -300,25 +279,22 @@ static int snd_gus_init_dma_irq(snd_gus_card_t * gus, int latches)
 		gus->mix_cntrl_reg |= 4;	/* enable MIC */
 	}
 	dma1 = gus->gf1.dma1;
-	dma1 = dma1 < 0 ? -dma1 : dma1;
+	dma1 = abs(dma1);
 	dma1 = dmas[dma1 & 7];
 	dma2 = gus->gf1.dma2;
-	dma2 = dma2 < 0 ? -dma2 : dma2;
+	dma2 = abs(dma2);
 	dma2 = dmas[dma2 & 7];
-#if 0
-	printk("dma1 = %i, dma2 = %i\n", gus->gf1.dma1, gus->gf1.dma2);
-#endif
 	dma1 |= gus->equal_dma ? 0x40 : (dma2 << 3);
 
 	if ((dma1 & 7) == 0 || (dma2 & 7) == 0) {
-		snd_printk("Error! DMA isn't defined.\n");
+		snd_printk(KERN_ERR "Error! DMA isn't defined.\n");
 		return -EINVAL;
 	}
 	irq = gus->gf1.irq;
-	irq = irq < 0 ? -irq : irq;
+	irq = abs(irq);
 	irq = irqs[irq & 0x0f];
 	if (irq == 0) {
-		snd_printk("Error! IRQ isn't defined.\n");
+		snd_printk(KERN_ERR "Error! IRQ isn't defined.\n");
 		return -EINVAL;
 	}
 	irq |= 0x40;
@@ -369,11 +345,11 @@ static int snd_gus_init_dma_irq(snd_gus_card_t * gus, int latches)
 	return 0;
 }
 
-static int snd_gus_check_version(snd_gus_card_t * gus)
+static int snd_gus_check_version(struct snd_gus_card * gus)
 {
 	unsigned long flags;
 	unsigned char val, rev;
-	snd_card_t *card;
+	struct snd_card *card;
 
 	card = gus->card;
 	spin_lock_irqsave(&gus->reg_lock, flags);
@@ -406,46 +382,34 @@ static int snd_gus_check_version(snd_gus_card_t * gus)
 				strcpy(card->longname, "Gravis UltraSound Extreme");
 				gus->ess_flag = 1;
 			} else {
-				snd_printk("unknown GF1 revision number at 0x%lx - 0x%x (0x%x)\n", gus->gf1.port, rev, val);
-				snd_printk("  please - report to <perex@suse.cz>\n");
+				snd_printk(KERN_ERR "unknown GF1 revision number at 0x%lx - 0x%x (0x%x)\n", gus->gf1.port, rev, val);
+				snd_printk(KERN_ERR "  please - report to <perex@perex.cz>\n");
 			}
 		}
 	}
-	strcpy(card->shortname, card->longname);
+	strscpy(card->shortname, card->longname, sizeof(card->shortname));
 	gus->uart_enable = 1;	/* standard GUSes doesn't have midi uart trouble */
 	snd_gus_init_control(gus);
 	return 0;
 }
 
-static void snd_gus_seq_dev_free(snd_seq_device_t *seq_dev)
-{
-	snd_gus_card_t *gus = seq_dev->private_data;
-	gus->seq_dev = NULL;
-}
-
-int snd_gus_initialize(snd_gus_card_t *gus)
+int snd_gus_initialize(struct snd_gus_card *gus)
 {
 	int err;
 
 	if (!gus->interwave) {
-		if ((err = snd_gus_check_version(gus)) < 0) {
-			snd_printk("version check failed\n");
+		err = snd_gus_check_version(gus);
+		if (err < 0) {
+			snd_printk(KERN_ERR "version check failed\n");
 			return err;
 		}
-		if ((err = snd_gus_detect_memory(gus)) < 0)
+		err = snd_gus_detect_memory(gus);
+		if (err < 0)
 			return err;
 	}
-	if ((err = snd_gus_init_dma_irq(gus, 1)) < 0)
+	err = snd_gus_init_dma_irq(gus, 1);
+	if (err < 0)
 		return err;
-#if defined(CONFIG_SND_SEQUENCER) || (defined(MODULE) && defined(CONFIG_SND_SEQUENCER_MODULE))
-	if (snd_seq_device_new(gus->card, 1, SNDRV_SEQ_DEV_ID_GUS,
-			       sizeof(snd_gus_card_t*), &gus->seq_dev) >= 0) {
-		strcpy(gus->seq_dev->name, "GUS");
-		*(snd_gus_card_t**)SNDRV_SEQ_DEVICE_ARGPTR(gus->seq_dev) = gus;
-		gus->seq_dev->private_data = gus;
-		gus->seq_dev->private_free = snd_gus_seq_dev_free;
-	}
-#endif
 	snd_gf1_start(gus);
 	gus->initialized = 1;
 	return 0;
@@ -459,7 +423,6 @@ EXPORT_SYMBOL(snd_gf1_write16);
 EXPORT_SYMBOL(snd_gf1_look16);
 EXPORT_SYMBOL(snd_gf1_i_write8);
 EXPORT_SYMBOL(snd_gf1_i_look8);
-EXPORT_SYMBOL(snd_gf1_i_write16);
 EXPORT_SYMBOL(snd_gf1_i_look16);
 EXPORT_SYMBOL(snd_gf1_dram_addr);
 EXPORT_SYMBOL(snd_gf1_write_addr);
@@ -470,8 +433,6 @@ EXPORT_SYMBOL(snd_gf1_alloc_voice);
 EXPORT_SYMBOL(snd_gf1_free_voice);
 EXPORT_SYMBOL(snd_gf1_ctrl_stop);
 EXPORT_SYMBOL(snd_gf1_stop_voice);
-EXPORT_SYMBOL(snd_gf1_start);
-EXPORT_SYMBOL(snd_gf1_stop);
   /* gus_mixer.c */
 EXPORT_SYMBOL(snd_gf1_new_mixer);
   /* gus_pcm.c */
@@ -496,19 +457,3 @@ EXPORT_SYMBOL(snd_gf1_mem_alloc);
 EXPORT_SYMBOL(snd_gf1_mem_xfree);
 EXPORT_SYMBOL(snd_gf1_mem_free);
 EXPORT_SYMBOL(snd_gf1_mem_lock);
-
-/*
- *  INIT part
- */
-
-static int __init alsa_gus_init(void)
-{
-	return 0;
-}
-
-static void __exit alsa_gus_exit(void)
-{
-}
-
-module_init(alsa_gus_init)
-module_exit(alsa_gus_exit)

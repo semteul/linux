@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* -*- linux-c -*-
  *
  *	$Id: sysrq.h,v 1.3 1997/07/17 11:54:33 mj Exp $
@@ -11,10 +12,11 @@
  *	based upon discusions in irc://irc.openprojects.net/#kernelnewbies
  */
 
-#include <linux/config.h>
+#ifndef _LINUX_SYSRQ_H
+#define _LINUX_SYSRQ_H
 
-struct pt_regs;
-struct tty_struct;
+#include <linux/errno.h>
+#include <linux/types.h>
 
 /* Possible values of bitmask for enabling sysrq functions */
 /* 0x0001 is reserved for enable everything */
@@ -28,10 +30,10 @@ struct tty_struct;
 #define SYSRQ_ENABLE_RTNICE	0x0100
 
 struct sysrq_key_op {
-	void (*handler)(int, struct pt_regs *, struct tty_struct *);
-	char *help_msg;
-	char *action_msg;
-	int enable_mask;
+	void (* const handler)(u8);
+	const char * const help_msg;
+	const char * const action_msg;
+	const int enable_mask;
 };
 
 #ifdef CONFIG_MAGIC_SYSRQ
@@ -41,20 +43,41 @@ struct sysrq_key_op {
  * are available -- else NULL's).
  */
 
-void handle_sysrq(int, struct pt_regs *, struct tty_struct *);
-void __handle_sysrq(int, struct pt_regs *, struct tty_struct *, int check_mask);
-int register_sysrq_key(int, struct sysrq_key_op *);
-int unregister_sysrq_key(int, struct sysrq_key_op *);
-struct sysrq_key_op *__sysrq_get_key_op(int key);
+void handle_sysrq(u8 key);
+void __handle_sysrq(u8 key, bool check_mask);
+int register_sysrq_key(u8 key, const struct sysrq_key_op *op);
+int unregister_sysrq_key(u8 key, const struct sysrq_key_op *op);
+extern const struct sysrq_key_op *__sysrq_reboot_op;
+
+int sysrq_toggle_support(int enable_mask);
+int sysrq_mask(void);
 
 #else
 
-static inline int __reterr(void)
+static inline void handle_sysrq(u8 key)
+{
+}
+
+static inline void __handle_sysrq(u8 key, bool check_mask)
+{
+}
+
+static inline int register_sysrq_key(u8 key, const struct sysrq_key_op *op)
 {
 	return -EINVAL;
 }
 
-#define register_sysrq_key(ig,nore) __reterr()
-#define unregister_sysrq_key(ig,nore) __reterr()
+static inline int unregister_sysrq_key(u8 key, const struct sysrq_key_op *op)
+{
+	return -EINVAL;
+}
+
+static inline int sysrq_mask(void)
+{
+	/* Magic SysRq disabled mask */
+	return 0;
+}
 
 #endif
+
+#endif /* _LINUX_SYSRQ_H */

@@ -1,23 +1,10 @@
-/* -*- mode: c; c-basic-offset: 8 -*- */
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PARISC LASI driver for the 53c700 chip
  *
  * Copyright (C) 2001 by James.Bottomley@HansenPartnership.com
 **-----------------------------------------------------------------------------
 **  
-**  This program is free software; you can redistribute it and/or modify
-**  it under the terms of the GNU General Public License as published by
-**  the Free Software Foundation; either version 2 of the License, or
-**  (at your option) any later version.
-**
-**  This program is distributed in the hope that it will be useful,
-**  but WITHOUT ANY WARRANTY; without even the implied warranty of
-**  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-**  GNU General Public License for more details.
-**
-**  You should have received a copy of the GNU General Public License
-**  along with this program; if not, write to the Free Software
-**  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 **
 **-----------------------------------------------------------------------------
  */
@@ -38,12 +25,11 @@
 #include <linux/stat.h>
 #include <linux/mm.h>
 #include <linux/blkdev.h>
-#include <linux/sched.h>
 #include <linux/ioport.h>
 #include <linux/dma-mapping.h>
+#include <linux/slab.h>
 
 #include <asm/page.h>
-#include <asm/pgtable.h>
 #include <asm/irq.h>
 #include <asm/hardware.h>
 #include <asm/parisc-device.h>
@@ -81,7 +67,7 @@ MODULE_LICENSE("GPL");
 #define LASI710_CLOCK	40
 #define LASI_SCSI_CORE_OFFSET 0x100
 
-static struct parisc_device_id lasi700_ids[] = {
+static const struct parisc_device_id lasi700_ids[] __initconst = {
 	LASI700_ID_TABLE,
 	LASI710_ID_TABLE,
 	{ 0 }
@@ -98,20 +84,18 @@ MODULE_DEVICE_TABLE(parisc, lasi700_ids);
 static int __init
 lasi700_probe(struct parisc_device *dev)
 {
-	unsigned long base = dev->hpa + LASI_SCSI_CORE_OFFSET;
+	unsigned long base = dev->hpa.start + LASI_SCSI_CORE_OFFSET;
 	struct NCR_700_Host_Parameters *hostdata;
 	struct Scsi_Host *host;
 
-	hostdata = kmalloc(sizeof(*hostdata), GFP_KERNEL);
+	hostdata = kzalloc(sizeof(*hostdata), GFP_KERNEL);
 	if (!hostdata) {
-		printk(KERN_ERR "%s: Failed to allocate host data\n",
-		       dev->dev.bus_id);
+		dev_printk(KERN_ERR, &dev->dev, "Failed to allocate host data\n");
 		return -ENOMEM;
 	}
-	memset(hostdata, 0, sizeof(struct NCR_700_Host_Parameters));
 
 	hostdata->dev = &dev->dev;
-	dma_set_mask(&dev->dev, DMA_32BIT_MASK);
+	dma_set_mask(&dev->dev, DMA_BIT_MASK(32));
 	hostdata->base = ioremap(base, 0x100);
 	hostdata->differential = 0;
 
@@ -123,9 +107,8 @@ lasi700_probe(struct parisc_device *dev)
 		hostdata->force_le_on_be = 0;
 		hostdata->chip710 = 1;
 		hostdata->dmode_extra = DMODE_FC2;
+		hostdata->burst_length = 8;
 	}
-
-	NCR_700_set_mem_mapped(hostdata);
 
 	host = NCR_700_detect(&lasi700_template, hostdata, &dev->dev);
 	if (!host)
@@ -133,7 +116,7 @@ lasi700_probe(struct parisc_device *dev)
 	host->this_id = 7;
 	host->base = base;
 	host->irq = dev->irq;
-	if(request_irq(dev->irq, NCR_700_intr, SA_SHIRQ, "lasi700", host)) {
+	if(request_irq(dev->irq, NCR_700_intr, IRQF_SHARED, "lasi700", host)) {
 		printk(KERN_ERR "lasi700: request_irq failed!\n");
 		goto out_put_host;
 	}
@@ -151,7 +134,7 @@ lasi700_probe(struct parisc_device *dev)
 	return -ENODEV;
 }
 
-static int __exit
+static void __exit
 lasi700_driver_remove(struct parisc_device *dev)
 {
 	struct Scsi_Host *host = dev_get_drvdata(&dev->dev);
@@ -163,15 +146,13 @@ lasi700_driver_remove(struct parisc_device *dev)
 	free_irq(host->irq, host);
 	iounmap(hostdata->base);
 	kfree(hostdata);
-
-	return 0;
 }
 
-static struct parisc_driver lasi700_driver = {
-	.name =		"Lasi SCSI",
+static struct parisc_driver lasi700_driver __refdata = {
+	.name =		"lasi_scsi",
 	.id_table =	lasi700_ids,
 	.probe =	lasi700_probe,
-	.remove =	__devexit_p(lasi700_driver_remove),
+	.remove =	__exit_p(lasi700_driver_remove),
 };
 
 static int __init

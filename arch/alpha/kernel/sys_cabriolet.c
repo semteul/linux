@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/sys_cabriolet.c
  *
@@ -5,11 +6,9 @@
  *	Copyright (C) 1996 Jay A Estabrook
  *	Copyright (C) 1998, 1999, 2000 Richard Henderson
  *
- * Code supporting the Cabriolet (AlphaPC64), EB66+, and EB164,
- * PC164 and LX164.
+ * Code supporting the PC164 and LX164.
  */
 
-#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/mm.h>
@@ -19,22 +18,18 @@
 #include <linux/bitops.h>
 
 #include <asm/ptrace.h>
-#include <asm/system.h>
 #include <asm/dma.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
 #include <asm/io.h>
-#include <asm/pgtable.h>
-#include <asm/core_apecs.h>
 #include <asm/core_cia.h>
-#include <asm/core_lca.h>
 #include <asm/tlbflush.h>
 
 #include "proto.h"
 #include "irq_impl.h"
 #include "pci_impl.h"
 #include "machvec_impl.h"
-
+#include "pc873xx.h"
 
 /* Note mask bit is true for DISABLED irqs.  */
 static unsigned long cached_irq_mask = ~0UL;
@@ -47,43 +42,26 @@ cabriolet_update_irq_hw(unsigned int irq, unsigned long mask)
 }
 
 static inline void
-cabriolet_enable_irq(unsigned int irq)
+cabriolet_enable_irq(struct irq_data *d)
 {
-	cabriolet_update_irq_hw(irq, cached_irq_mask &= ~(1UL << irq));
+	cabriolet_update_irq_hw(d->irq, cached_irq_mask &= ~(1UL << d->irq));
 }
 
 static void
-cabriolet_disable_irq(unsigned int irq)
+cabriolet_disable_irq(struct irq_data *d)
 {
-	cabriolet_update_irq_hw(irq, cached_irq_mask |= 1UL << irq);
+	cabriolet_update_irq_hw(d->irq, cached_irq_mask |= 1UL << d->irq);
 }
 
-static unsigned int
-cabriolet_startup_irq(unsigned int irq)
-{ 
-	cabriolet_enable_irq(irq);
-	return 0; /* never anything pending */
-}
-
-static void
-cabriolet_end_irq(unsigned int irq)
-{ 
-	if (!(irq_desc[irq].status & (IRQ_DISABLED|IRQ_INPROGRESS)))
-		cabriolet_enable_irq(irq);
-}
-
-static struct hw_interrupt_type cabriolet_irq_type = {
-	.typename	= "CABRIOLET",
-	.startup	= cabriolet_startup_irq,
-	.shutdown	= cabriolet_disable_irq,
-	.enable		= cabriolet_enable_irq,
-	.disable	= cabriolet_disable_irq,
-	.ack		= cabriolet_disable_irq,
-	.end		= cabriolet_end_irq,
+static struct irq_chip cabriolet_irq_type = {
+	.name		= "CABRIOLET",
+	.irq_unmask	= cabriolet_enable_irq,
+	.irq_mask	= cabriolet_disable_irq,
+	.irq_mask_ack	= cabriolet_disable_irq,
 };
 
 static void 
-cabriolet_device_interrupt(unsigned long v, struct pt_regs *r)
+cabriolet_device_interrupt(unsigned long v)
 {
 	unsigned long pld;
 	unsigned int i;
@@ -99,15 +77,15 @@ cabriolet_device_interrupt(unsigned long v, struct pt_regs *r)
 		i = ffz(~pld);
 		pld &= pld - 1;	/* clear least bit set */
 		if (i == 4) {
-			isa_device_interrupt(v, r);
+			isa_device_interrupt(v);
 		} else {
-			handle_irq(16 + i, r);
+			handle_irq(16 + i);
 		}
 	}
 }
 
 static void __init
-common_init_irq(void (*srm_dev_int)(unsigned long v, struct pt_regs *r))
+common_init_irq(void (*srm_dev_int)(unsigned long v))
 {
 	init_i8259a_irqs();
 
@@ -123,13 +101,15 @@ common_init_irq(void (*srm_dev_int)(unsigned long v, struct pt_regs *r))
 		outb(0xff, 0x806);
 
 		for (i = 16; i < 35; ++i) {
-			irq_desc[i].status = IRQ_DISABLED | IRQ_LEVEL;
-			irq_desc[i].handler = &cabriolet_irq_type;
+			irq_set_chip_and_handler(i, &cabriolet_irq_type,
+						 handle_level_irq);
+			irq_set_status_flags(i, IRQ_LEVEL);
 		}
 	}
 
 	common_init_isa_dma();
-	setup_irq(16+4, &isa_cascade_irqaction);
+	if (request_irq(16 + 4, no_action, 0, "isa-cascade", NULL))
+		pr_err("Failed to register isa-cascade interrupt\n");
 }
 
 #ifndef CONFIG_ALPHA_PC164
@@ -155,18 +135,18 @@ cabriolet_init_irq(void)
    too invasive though.  */
 
 static void
-pc164_srm_device_interrupt(unsigned long v, struct pt_regs *r)
+pc164_srm_device_interrupt(unsigned long v)
 {
 	__min_ipl = getipl();
-	srm_device_interrupt(v, r);
+	srm_device_interrupt(v);
 	__min_ipl = 0;
 }
 
 static void
-pc164_device_interrupt(unsigned long v, struct pt_regs *r)
+pc164_device_interrupt(unsigned long v)
 {
 	__min_ipl = getipl();
-	cabriolet_device_interrupt(v, r);
+	cabriolet_device_interrupt(v);
 	__min_ipl = 0;
 }
 
@@ -191,10 +171,10 @@ pc164_init_irq(void)
  * because it is the Saturn IO (SIO) PCI/ISA Bridge Chip.
  */
 
-static inline int __init
-eb66p_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
+static inline int
+eb66p_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 {
-	static char irq_tab[5][5] __initdata = {
+	static char irq_tab[5][5] = {
 		/*INT  INTA  INTB  INTC   INTD */
 		{16+0, 16+0, 16+5,  16+9, 16+13},  /* IdSel 6,  slot 0, J25 */
 		{16+1, 16+1, 16+6, 16+10, 16+14},  /* IdSel 7,  slot 1, J26 */
@@ -221,10 +201,10 @@ eb66p_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
  * because it is the Saturn IO (SIO) PCI/ISA Bridge Chip.
  */
 
-static inline int __init
-cabriolet_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
+static inline int
+cabriolet_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 {
-	static char irq_tab[5][5] __initdata = {
+	static char irq_tab[5][5] = {
 		/*INT   INTA  INTB  INTC   INTD */
 		{ 16+2, 16+2, 16+7, 16+11, 16+15}, /* IdSel 5,  slot 2, J21 */
 		{ 16+0, 16+0, 16+5,  16+9, 16+13}, /* IdSel 6,  slot 0, J19 */
@@ -237,17 +217,23 @@ cabriolet_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 }
 
 static inline void __init
-cabriolet_init_pci(void)
+cabriolet_enable_ide(void)
 {
-	common_init_pci();
-	ns87312_enable_ide(0x398);
+	if (pc873xx_probe() == -1) {
+		printk(KERN_ERR "Probing for PC873xx Super IO chip failed.\n");
+	 } else {
+		printk(KERN_INFO "Found %s Super IO chip at 0x%x\n",
+			pc873xx_get_model(), pc873xx_get_base());
+
+		pc873xx_enable_ide();
+	}
 }
 
 static inline void __init
 cia_cab_init_pci(void)
 {
 	cia_init_pci();
-	ns87312_enable_ide(0x398);
+	cabriolet_enable_ide();
 }
 
 /*
@@ -292,10 +278,10 @@ cia_cab_init_pci(void)
  * 
  */
 
-static inline int __init
-alphapc164_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
+static inline int
+alphapc164_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 {
-	static char irq_tab[7][5] __initdata = {
+	static char irq_tab[7][5] = {
 		/*INT   INTA  INTB   INTC   INTD */
 		{ 16+2, 16+2, 16+9,  16+13, 16+17}, /* IdSel  5, slot 2, J20 */
 		{ 16+0, 16+0, 16+7,  16+11, 16+15}, /* IdSel  6, slot 0, J29 */
@@ -320,81 +306,6 @@ alphapc164_init_pci(void)
 /*
  * The System Vector
  */
-
-#if defined(CONFIG_ALPHA_GENERIC) || defined(CONFIG_ALPHA_CABRIOLET)
-struct alpha_machine_vector cabriolet_mv __initmv = {
-	.vector_name		= "Cabriolet",
-	DO_EV4_MMU,
-	DO_DEFAULT_RTC,
-	DO_APECS_IO,
-	.machine_check		= apecs_machine_check,
-	.max_isa_dma_address	= ALPHA_MAX_ISA_DMA_ADDRESS,
-	.min_io_address		= DEFAULT_IO_BASE,
-	.min_mem_address	= APECS_AND_LCA_DEFAULT_MEM_BASE,
-
-	.nr_irqs		= 35,
-	.device_interrupt	= cabriolet_device_interrupt,
-
-	.init_arch		= apecs_init_arch,
-	.init_irq		= cabriolet_init_irq,
-	.init_rtc		= common_init_rtc,
-	.init_pci		= cabriolet_init_pci,
-	.pci_map_irq		= cabriolet_map_irq,
-	.pci_swizzle		= common_swizzle,
-};
-#ifndef CONFIG_ALPHA_EB64P
-ALIAS_MV(cabriolet)
-#endif
-#endif
-
-#if defined(CONFIG_ALPHA_GENERIC) || defined(CONFIG_ALPHA_EB164)
-struct alpha_machine_vector eb164_mv __initmv = {
-	.vector_name		= "EB164",
-	DO_EV5_MMU,
-	DO_DEFAULT_RTC,
-	DO_CIA_IO,
-	.machine_check		= cia_machine_check,
-	.max_isa_dma_address	= ALPHA_MAX_ISA_DMA_ADDRESS,
-	.min_io_address		= DEFAULT_IO_BASE,
-	.min_mem_address	= CIA_DEFAULT_MEM_BASE,
-
-	.nr_irqs		= 35,
-	.device_interrupt	= cabriolet_device_interrupt,
-
-	.init_arch		= cia_init_arch,
-	.init_irq		= cabriolet_init_irq,
-	.init_rtc		= common_init_rtc,
-	.init_pci		= cia_cab_init_pci,
-	.kill_arch		= cia_kill_arch,
-	.pci_map_irq		= cabriolet_map_irq,
-	.pci_swizzle		= common_swizzle,
-};
-ALIAS_MV(eb164)
-#endif
-
-#if defined(CONFIG_ALPHA_GENERIC) || defined(CONFIG_ALPHA_EB66P)
-struct alpha_machine_vector eb66p_mv __initmv = {
-	.vector_name		= "EB66+",
-	DO_EV4_MMU,
-	DO_DEFAULT_RTC,
-	DO_LCA_IO,
-	.machine_check		= lca_machine_check,
-	.max_isa_dma_address	= ALPHA_MAX_ISA_DMA_ADDRESS,
-	.min_io_address		= DEFAULT_IO_BASE,
-	.min_mem_address	= APECS_AND_LCA_DEFAULT_MEM_BASE,
-
-	.nr_irqs		= 35,
-	.device_interrupt	= cabriolet_device_interrupt,
-
-	.init_arch		= lca_init_arch,
-	.init_irq		= cabriolet_init_irq,
-	.init_rtc		= common_init_rtc,
-	.init_pci		= cabriolet_init_pci,
-	.pci_map_irq		= eb66p_map_irq,
-	.pci_swizzle		= common_swizzle,
-};
-ALIAS_MV(eb66p)
-#endif
 
 #if defined(CONFIG_ALPHA_GENERIC) || defined(CONFIG_ALPHA_LX164)
 struct alpha_machine_vector lx164_mv __initmv = {

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
     NetWinder Floating Point Emulator
     (c) Rebel.COM, 1998
@@ -5,20 +6,10 @@
 
     Direct questions, comments to Scott Bambrough <scottb@netwinder.org>
 
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
+#include <linux/linkage.h>
+#include <asm/assembler.h>
+#include <asm/opcodes.h>
 
 /* This is the kernel's entry point into the floating point emulator.
 It is called from the kernel with code similar to this:
@@ -70,50 +61,130 @@ floating point instructions.  GCC attempts to group floating point
 instructions to allow the emulator to spread the cost of the trap over
 several floating point instructions.  */
 
+#include <asm/asm-offsets.h>
+
 	.globl	nwfpe_enter
 nwfpe_enter:
 	mov	r4, lr			@ save the failure-return addresses
 	mov	sl, sp			@ we access the registers via 'sl'
 
-	ldr	r5, [sp, #60]		@ get contents of PC;
+	ldr	r5, [sp, #S_PC]		@ get contents of PC;
+	mov	r6, r0			@ save the opcode
 emulate:
+	ldr	r1, [sp, #S_PSR]	@ fetch the PSR
+	bl	arm_check_condition	@ check the condition
+	cmp	r0, #ARM_OPCODE_CONDTEST_PASS	@ condition passed?
+
+	@ if condition code failed to match, next insn
+	bne	next			@ get the next instruction;
+
+	mov	r0, r6			@ prepare for EmulateAll()
 	bl	EmulateAll		@ emulate the instruction
 	cmp	r0, #0			@ was emulation successful
-	moveq	pc, r4			@ no, return failure
+	reteq	r4			@ no, return failure
 
 next:
+	uaccess_enable r3
 .Lx1:	ldrt	r6, [r5], #4		@ get the next instruction and
 					@ increment PC
-
+	uaccess_disable r3
 	and	r2, r6, #0x0F000000	@ test for FP insns
 	teq	r2, #0x0C000000
 	teqne	r2, #0x0D000000
 	teqne	r2, #0x0E000000
-	movne	pc, r9			@ return ok if not a fp insn
+	retne	r9			@ return ok if not a fp insn
 
-	str	r5, [sp, #60]		@ update PC copy in regs
+	str	r5, [sp, #S_PC]		@ update PC copy in regs
 
 	mov	r0, r6			@ save a copy
-	ldr	r1, [sp, #64]		@ fetch the condition codes
-	bl	checkCondition		@ check the condition
-	cmp	r0, #0			@ r0 = 0 ==> condition failed
-
-	@ if condition code failed to match, next insn
-	beq	next			@ get the next instruction;
-
-	mov	r0, r6			@ prepare for EmulateAll()
-	b	emulate			@ if r0 != 0, goto EmulateAll
+	b	emulate			@ check condition and emulate
 
 	@ We need to be prepared for the instructions at .Lx1 and .Lx2 
 	@ to fault.  Emit the appropriate exception gunk to fix things up.
 	@ ??? For some reason, faults can happen at .Lx2 even with a
 	@ plain LDR instruction.  Weird, but it seems harmless.
-	.section .fixup,"ax"
+	.pushsection .text.fixup,"ax"
 	.align	2
-.Lfix:	mov	pc, r9			@ let the user eat segfaults
-	.previous
+.Lrep:	str     r4, [sp, #S_PC]		@ retry current instruction
+.Lfix:	ret	r9			@ let the user eat segfaults
+	.popsection
 
-	.section __ex_table,"a"
+	.pushsection __ex_table,"a"
 	.align	3
 	.long	.Lx1, .Lfix
-	.previous
+	.popsection
+
+	@
+	@ Check whether the instruction is a co-processor instruction.
+	@ If yes, we need to call the relevant co-processor handler.
+	@ Only FPE instructions are dispatched here, everything else
+	@ is handled by undef hooks.
+	@
+	@ Emulators may wish to make use of the following registers:
+	@  r4  = PC value to resume execution after successful emulation
+	@  r9  = normal "successful" return address
+	@  lr  = unrecognised instruction return address
+	@ IRQs enabled, FIQs enabled.
+	@
+ENTRY(call_fpe)
+	mov	r2, r4
+	sub	r4, r4, #4			@ ARM instruction at user PC - 4
+USERL(	.Lrep,	ldrt r0, [r4])			@ load opcode from user space
+ARM_BE8(rev	r0, r0)				@ little endian instruction
+
+	uaccess_disable ip
+
+	get_thread_info r10			@ get current thread
+	tst	r0, #0x08000000			@ only CDP/CPRT/LDC/STC have bit 27
+	reteq	lr
+	and	r8, r0, #0x00000f00		@ mask out CP number
+#ifdef CONFIG_IWMMXT
+	@ Test if we need to give access to iWMMXt coprocessors
+	ldr	r5, [r10, #TI_FLAGS]
+	rsbs	r7, r8, #(1 << 8)		@ CP 0 or 1 only
+	movscs	r7, r5, lsr #(TIF_USING_IWMMXT + 1)
+	movcs	r0, sp				@ pass struct pt_regs
+	bcs	iwmmxt_task_enable
+#endif
+	add	pc, pc, r8, lsr #6
+	nop
+
+	ret	lr				@ CP#0
+	b	do_fpe				@ CP#1 (FPE)
+	b	do_fpe				@ CP#2 (FPE)
+	ret	lr				@ CP#3
+	ret	lr				@ CP#4
+	ret	lr				@ CP#5
+	ret	lr				@ CP#6
+	ret	lr				@ CP#7
+	ret	lr				@ CP#8
+	ret	lr				@ CP#9
+	ret	lr				@ CP#10 (VFP)
+	ret	lr				@ CP#11 (VFP)
+	ret	lr				@ CP#12
+	ret	lr				@ CP#13
+	ret	lr				@ CP#14 (Debug)
+	ret	lr				@ CP#15 (Control)
+
+do_fpe:
+	add	r10, r10, #TI_FPSTATE		@ r10 = workspace
+	ldr_va	pc, fp_enter, tmp=r4		@ Call FP module USR entry point
+
+	@
+	@ The FP module is called with these registers set:
+	@  r0  = instruction
+	@  r2  = PC+4
+	@  r9  = normal "successful" return address
+	@  r10 = FP workspace
+	@  lr  = unrecognised FP instruction return address
+	@
+
+	.pushsection .data
+	.align	2
+ENTRY(fp_enter)
+	.word	no_fp
+	.popsection
+
+no_fp:
+	ret	lr
+ENDPROC(no_fp)

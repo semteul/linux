@@ -15,6 +15,7 @@
 struct kyrofb_info {
 	void __iomem *regbase;
 
+	u32 palette[16];
 	u32 HTot;	/* Hor Total Time    */
 	u32 HFP;	/* Hor Front Porch   */
 	u32 HST;	/* Hor Sync Time     */
@@ -31,25 +32,11 @@ struct kyrofb_info {
 	u32 PIXCLK;	/* Pixel Clock       */
 	u32 HCLK;	/* Hor Clock         */
 
-	/* Usefull to hold depth here for Linux */
+	/* Useful to hold depth here for Linux */
 	u8 PIXDEPTH;
 
-#ifdef CONFIG_MTRR
-	int mtrr_handle;
-#endif
+	int wc_cookie;
 };
-
-extern int kyro_dev_init(void);
-extern void kyro_dev_reset(void);
-
-extern unsigned char *kyro_dev_physical_fb_ptr(void);
-extern unsigned char *kyro_dev_virtual_fb_ptr(void);
-extern void *kyro_dev_physical_regs_ptr(void);
-extern void *kyro_dev_virtual_regs_ptr(void);
-extern unsigned int kyro_dev_fb_size(void);
-extern unsigned int kyro_dev_regs_size(void);
-
-extern u32 kyro_dev_overlay_offset(void);
 
 /*
  * benedict.gaster@superh.com

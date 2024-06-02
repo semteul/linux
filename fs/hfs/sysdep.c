@@ -8,30 +8,39 @@
  * This file contains the code to do various system dependent things.
  */
 
+#include <linux/namei.h>
 #include "hfs_fs.h"
 
 /* dentry case-handling: just lowercase everything */
 
-static int hfs_revalidate_dentry(struct dentry *dentry, struct nameidata *nd)
+static int hfs_revalidate_dentry(struct dentry *dentry, unsigned int flags)
 {
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode;
 	int diff;
 
+	if (flags & LOOKUP_RCU)
+		return -ECHILD;
+
+	inode = d_inode(dentry);
 	if(!inode)
 		return 1;
 
 	/* fix up inode on a timezone change */
 	diff = sys_tz.tz_minuteswest * 60 - HFS_I(inode)->tz_secondswest;
 	if (diff) {
-		inode->i_ctime.tv_sec += diff;
-		inode->i_atime.tv_sec += diff;
-		inode->i_mtime.tv_sec += diff;
+		struct timespec64 ts = inode_get_ctime(inode);
+
+		inode_set_ctime(inode, ts.tv_sec + diff, ts.tv_nsec);
+		ts = inode_get_atime(inode);
+		inode_set_atime(inode, ts.tv_sec + diff, ts.tv_nsec);
+		ts = inode_get_mtime(inode);
+		inode_set_mtime(inode, ts.tv_sec + diff, ts.tv_nsec);
 		HFS_I(inode)->tz_secondswest += diff;
 	}
 	return 1;
 }
 
-struct dentry_operations hfs_dentry_operations =
+const struct dentry_operations hfs_dentry_operations =
 {
 	.d_revalidate	= hfs_revalidate_dentry,
 	.d_hash		= hfs_hash_dentry,

@@ -1,32 +1,17 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_AK4531_CODEC_H
 #define __SOUND_AK4531_CODEC_H
 
 /*
- *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
  *  Universal interface for Audio Codec '97
  *
  *  For more details look to AC '97 component specification revision 2.1
  *  by Intel Corporation (http://developer.intel.com).
- *
- *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
  */
 
-#include "info.h"
-#include "control.h"
+#include <sound/info.h>
+#include <sound/control.h>
 
 /*
  *  ASAHI KASEI - AK4531 codec
@@ -64,17 +49,25 @@
 #define AK4531_AD_IN    0x18	/* AD input select */
 #define AK4531_MIC_GAIN 0x19	/* MIC amplified gain */
 
-typedef struct _snd_ak4531 ak4531_t;
-
-struct _snd_ak4531 {
-	void (*write) (ak4531_t *ak4531, unsigned short reg, unsigned short val);
+struct snd_ak4531 {
+	void (*write) (struct snd_ak4531 *ak4531, unsigned short reg,
+		       unsigned short val);
 	void *private_data;
-	void (*private_free) (ak4531_t *ak4531);
+	void (*private_free) (struct snd_ak4531 *ak4531);
 	/* --- */
 	unsigned char regs[0x20];
-	struct semaphore reg_mutex;
+	struct mutex reg_mutex;
 };
 
-int snd_ak4531_mixer(snd_card_t * card, ak4531_t * _ak4531, ak4531_t ** rak4531);
+int snd_ak4531_mixer(struct snd_card *card, struct snd_ak4531 *_ak4531,
+		     struct snd_ak4531 **rak4531);
+
+#ifdef CONFIG_PM
+void snd_ak4531_suspend(struct snd_ak4531 *ak4531);
+void snd_ak4531_resume(struct snd_ak4531 *ak4531);
+#else
+static inline void snd_ak4531_suspend(struct snd_ak4531 *ak4531) {}
+static inline void snd_ak4531_resume(struct snd_ak4531 *ak4531) {}
+#endif
 
 #endif /* __SOUND_AK4531_CODEC_H */

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/core_marvel.c
  *
@@ -17,14 +18,13 @@
 #include <linux/mc146818rtc.h>
 #include <linux/rtc.h>
 #include <linux/module.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 
 #include <asm/ptrace.h>
 #include <asm/smp.h>
 #include <asm/gct.h>
-#include <asm/pgalloc.h>
 #include <asm/tlbflush.h>
-#include <asm/rtc.h>
+#include <asm/vga.h>
 
 #include "proto.h"
 #include "pci_impl.h"
@@ -81,7 +81,10 @@ mk_resource_name(int pe, int port, char *str)
 	char *name;
 	
 	sprintf(tmp, "PCI %s PE %d PORT %d", str, pe, port);
-	name = alloc_bootmem(strlen(tmp) + 1);
+	name = memblock_alloc(strlen(tmp) + 1, SMP_CACHE_BYTES);
+	if (!name)
+		panic("%s: Failed to allocate %zu bytes\n", __func__,
+		      strlen(tmp) + 1);
 	strcpy(name, tmp);
 
 	return name;
@@ -116,9 +119,12 @@ alloc_io7(unsigned int pe)
 		return NULL;
 	}
 
-	io7 = alloc_bootmem(sizeof(*io7));
+	io7 = memblock_alloc(sizeof(*io7), SMP_CACHE_BYTES);
+	if (!io7)
+		panic("%s: Failed to allocate %zu bytes\n", __func__,
+		      sizeof(*io7));
 	io7->pe = pe;
-	spin_lock_init(&io7->irq_lock);
+	raw_spin_lock_init(&io7->irq_lock);
 
 	for (h = 0; h < 4; h++) {
 		io7->ports[h].io7 = io7;
@@ -281,8 +287,7 @@ io7_init_hose(struct io7 *io7, int port)
 	/*
 	 * Set up window 0 for scatter-gather 8MB at 8MB.
 	 */
-	hose->sg_isa = iommu_arena_new_node(marvel_cpuid_to_nid(io7->pe),
-					    hose, 0x00800000, 0x00800000, 0);
+	hose->sg_isa = iommu_arena_new_node(0, hose, 0x00800000, 0x00800000, 0);
 	hose->sg_isa->align_entry = 8;	/* cache line boundary */
 	csrs->POx_WBASE[0].csr = 
 		hose->sg_isa->dma_base | wbase_m_ena | wbase_m_sg;
@@ -299,8 +304,7 @@ io7_init_hose(struct io7 *io7, int port)
 	/*
 	 * Set up window 2 for scatter-gather (up-to) 1GB at 3GB.
 	 */
-	hose->sg_pci = iommu_arena_new_node(marvel_cpuid_to_nid(io7->pe),
-					    hose, 0xc0000000, 0x40000000, 0);
+	hose->sg_pci = iommu_arena_new_node(0, hose, 0xc0000000, 0x40000000, 0);
 	hose->sg_pci->align_entry = 8;	/* cache line boundary */
 	csrs->POx_WBASE[2].csr = 
 		hose->sg_pci->dma_base | wbase_m_ena | wbase_m_sg;
@@ -351,7 +355,7 @@ marvel_init_io7(struct io7 *io7)
 	}
 }
 
-void
+static void __init
 marvel_io7_present(gct6_node *node)
 {
 	int pe;
@@ -367,7 +371,7 @@ marvel_io7_present(gct6_node *node)
 }
 
 static void __init
-marvel_init_vga_hose(void)
+marvel_find_console_vga_hose(void)
 {
 #ifdef CONFIG_VGA_HOSE
 	u64 *pu64 = (u64 *)((u64)hwrpb + hwrpb->ctbt_offset);
@@ -403,10 +407,10 @@ marvel_init_vga_hose(void)
 			pci_vga_hose = hose;
 		}
 	}
-#endif /* CONFIG_VGA_HOSE */
+#endif
 }
 
-gct6_search_struct gct_wanted_node_list[] = {
+gct6_search_struct gct_wanted_node_list[] __initdata = {
 	{ GCT_TYPE_HOSE, GCT_SUBTYPE_IO_PORT_MODULE, marvel_io7_present },
 	{ 0, 0, NULL }
 };
@@ -435,7 +439,7 @@ marvel_specify_io7(char *str)
 		str = pchar;
 	} while(*str);
 
-	return 0;
+	return 1;
 }
 __setup("io7=", marvel_specify_io7);
 
@@ -459,7 +463,7 @@ marvel_init_arch(void)
 		marvel_init_io7(io7);
 
 	/* Check for graphic console location (if any).  */
-	marvel_init_vga_hose();
+	marvel_find_console_vga_hose();
 }
 
 void
@@ -656,20 +660,12 @@ __marvel_rtc_io(u8 b, unsigned long addr, int write)
 
 	case 0x71:					/* RTC_PORT(1) */
 		rtc_access.index = index;
-		rtc_access.data = BCD_TO_BIN(b);
+		rtc_access.data = bcd2bin(b);
 		rtc_access.function = 0x48 + !write;	/* GET/PUT_TOY */
 
-#ifdef CONFIG_SMP
-		if (smp_processor_id() != boot_cpuid)
-			smp_call_function_on_cpu(__marvel_access_rtc,
-						 &rtc_access, 1, 1,
-						 cpumask_of_cpu(boot_cpuid));
-		else
-			__marvel_access_rtc(&rtc_access);
-#else
 		__marvel_access_rtc(&rtc_access);
-#endif
-		ret = BIN_TO_BCD(rtc_access.data);
+
+		ret = bin2bcd(rtc_access.data);
 		break;
 
 	default:
@@ -684,9 +680,6 @@ __marvel_rtc_io(u8 b, unsigned long addr, int write)
 /*
  * IO map support.
  */
-
-#define __marvel_is_mem_vga(a)	(((a) >= 0xa0000) && ((a) <= 0xc0000))
-
 void __iomem *
 marvel_ioremap(unsigned long addr, unsigned long size)
 {
@@ -698,13 +691,9 @@ marvel_ioremap(unsigned long addr, unsigned long size)
 	unsigned long pfn;
 
 	/*
-	 * Adjust the addr.
+	 * Adjust the address.
 	 */ 
-#ifdef CONFIG_VGA_HOSE
-	if (pci_vga_hose && __marvel_is_mem_vga(addr)) {
-		addr += pci_vga_hose->mem_space->start;
-	}
-#endif
+	FIXUP_MEMADDR_VGA(addr);
 
 	/*
 	 * Find the hose.
@@ -781,7 +770,9 @@ marvel_ioremap(unsigned long addr, unsigned long size)
 		return (void __iomem *) vaddr;
 	}
 
-	return NULL;
+	/* Assume it was already a reasonable address */
+	vaddr = baddr + hose->mem_space->start;
+	return (void __iomem *) vaddr;
 }
 
 void
@@ -803,34 +794,31 @@ marvel_is_mmio(const volatile void __iomem *xaddr)
 		return (addr & 0xFF000000UL) == 0;
 }
 
-#define __marvel_is_port_vga(a)	\
-  (((a) >= 0x3b0) && ((a) < 0x3e0) && ((a) != 0x3b3) && ((a) != 0x3d3))
 #define __marvel_is_port_kbd(a)	(((a) == 0x60) || ((a) == 0x64))
 #define __marvel_is_port_rtc(a)	(((a) == 0x70) || ((a) == 0x71))
 
 void __iomem *marvel_ioportmap (unsigned long addr)
 {
-	if (__marvel_is_port_rtc (addr) || __marvel_is_port_kbd(addr))
-		;
-#ifdef CONFIG_VGA_HOSE
-	else if (__marvel_is_port_vga (addr) && pci_vga_hose)
-		addr += pci_vga_hose->io_space->start;
-#endif
-	else
-		return NULL;
+	FIXUP_IOADDR_VGA(addr);
 	return (void __iomem *)addr;
 }
 
-unsigned int
-marvel_ioread8(void __iomem *xaddr)
+u8
+marvel_ioread8(const void __iomem *xaddr)
 {
 	unsigned long addr = (unsigned long) xaddr;
 	if (__marvel_is_port_kbd(addr))
 		return 0;
 	else if (__marvel_is_port_rtc(addr))
 		return __marvel_rtc_io(0, addr, 0);
-	else
+	else if (marvel_is_ioaddr(addr))
 		return __kernel_ldbu(*(vucp)addr);
+	else
+		/* this should catch other legacy addresses
+		   that would normally fail on MARVEL,
+		   because there really is nothing there...
+		*/
+		return ~0;
 }
 
 void
@@ -841,7 +829,7 @@ marvel_iowrite8(u8 b, void __iomem *xaddr)
 		return;
 	else if (__marvel_is_port_rtc(addr)) 
 		__marvel_rtc_io(b, addr, 1);
-	else
+	else if (marvel_is_ioaddr(addr))
 		__kernel_stb(b, *(vucp)addr);
 }
 
@@ -853,53 +841,8 @@ EXPORT_SYMBOL(marvel_ioportmap);
 EXPORT_SYMBOL(marvel_ioread8);
 EXPORT_SYMBOL(marvel_iowrite8);
 #endif
-
+
 /*
- * NUMA Support
- */
-/**********
- * FIXME - for now each cpu is a node by itself 
- *              -- no real support for striped mode 
- **********
- */
-int
-marvel_pa_to_nid(unsigned long pa)
-{
-	int cpuid;
-
-	if ((pa >> 43) & 1) 	/* I/O */ 
-		cpuid = (~(pa >> 35) & 0xff);
-	else			/* mem */
-		cpuid = ((pa >> 34) & 0x3) | ((pa >> (37 - 2)) & (0x1f << 2));
-
-	return marvel_cpuid_to_nid(cpuid);
-}
-
-int
-marvel_cpuid_to_nid(int cpuid)
-{
-	return cpuid;
-}
-
-unsigned long
-marvel_node_mem_start(int nid)
-{
-	unsigned long pa;
-
-	pa = (nid & 0x3) | ((nid & (0x1f << 2)) << 1);
-	pa <<= 34;
-
-	return pa;
-}
-
-unsigned long
-marvel_node_mem_size(int nid)
-{
-	return 16UL * 1024 * 1024 * 1024; /* 16GB */
-}
-
-
-/* 
  * AGP GART Support.
  */
 #include <linux/agp_backend.h>
@@ -1003,7 +946,7 @@ marvel_agp_configure(alpha_agp_info *agp)
 		 * rate, but warn the user.
 		 */
 		printk("%s: unknown PLL setting RNGB=%lx (PLL6_CTL=%016lx)\n",
-		       __FUNCTION__, IO7_PLL_RNGB(agp_pll), agp_pll);
+		       __func__, IO7_PLL_RNGB(agp_pll), agp_pll);
 		break;
 	}
 
@@ -1033,7 +976,7 @@ marvel_agp_bind_memory(alpha_agp_info *agp, off_t pg_start, struct agp_memory *m
 {
 	struct marvel_agp_aperture *aper = agp->aperture.sysdata;
 	return iommu_bind(aper->arena, aper->pg_start + pg_start, 
-			  mem->page_count, mem->memory);
+			  mem->page_count, mem->pages);
 }
 
 static int 
@@ -1053,13 +996,13 @@ marvel_agp_translate(alpha_agp_info *agp, dma_addr_t addr)
 
 	if (addr < agp->aperture.bus_base ||
 	    addr >= agp->aperture.bus_base + agp->aperture.size) {
-		printk("%s: addr out of range\n", __FUNCTION__);
+		printk("%s: addr out of range\n", __func__);
 		return -EINVAL;
 	}
 
 	pte = aper->arena->ptes[baddr >> PAGE_SHIFT];
 	if (!(pte & 1)) {
-		printk("%s: pte not valid\n", __FUNCTION__);
+		printk("%s: pte not valid\n", __func__);
 		return -EINVAL;
 	} 
 	return (pte >> 1) << PAGE_SHIFT;
@@ -1120,6 +1063,8 @@ marvel_agp_info(void)
 	 * Allocate the info structure.
 	 */
 	agp = kmalloc(sizeof(*agp), GFP_KERNEL);
+	if (!agp)
+		return NULL;
 
 	/*
 	 * Fill it in.

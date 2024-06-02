@@ -1,11 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/lib/io-writesb.S
  *
  *  Copyright (C) 1995-2000 Russell King
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
@@ -30,63 +27,65 @@
 #endif
 		.endm
 
-.outsb_align:	rsb	ip, ip, #4
+.Loutsb_align:	rsb	ip, ip, #4
 		cmp	ip, r2
 		movgt	ip, r2
 		cmp	ip, #2
 		ldrb	r3, [r1], #1
 		strb	r3, [r0]
-		ldrgeb	r3, [r1], #1
-		strgeb	r3, [r0]
-		ldrgtb	r3, [r1], #1
-		strgtb	r3, [r0]
+		ldrbge	r3, [r1], #1
+		strbge	r3, [r0]
+		ldrbgt	r3, [r1], #1
+		strbgt	r3, [r0]
 		subs	r2, r2, ip
-		bne	.outsb_aligned
+		bne	.Loutsb_aligned
 
 ENTRY(__raw_writesb)
 		teq	r2, #0		@ do we have to check for the zero len?
-		moveq	pc, lr
+		reteq	lr
 		ands	ip, r1, #3
-		bne	.outsb_align
+		bne	.Loutsb_align
 
-.outsb_aligned:	stmfd	sp!, {r4, r5, lr}
+.Loutsb_aligned:
+		stmfd	sp!, {r4, r5, lr}
 
 		subs	r2, r2, #16
-		bmi	.outsb_no_16
+		bmi	.Loutsb_no_16
 
-.outsb_16_lp:	ldmia	r1!, {r3, r4, r5, ip}
+.Loutsb_16_lp:	ldmia	r1!, {r3, r4, r5, ip}
 		outword	r3
 		outword	r4
 		outword	r5
 		outword	ip
 		subs	r2, r2, #16
-		bpl	.outsb_16_lp
+		bpl	.Loutsb_16_lp
 
 		tst	r2, #15
-		LOADREGS(eqfd, sp!, {r4, r5, pc})
+		ldmfdeq	sp!, {r4, r5, pc}
 
-.outsb_no_16:	tst	r2, #8
-		beq	.outsb_no_8
+.Loutsb_no_16:	tst	r2, #8
+		beq	.Loutsb_no_8
 
 		ldmia	r1!, {r3, r4}
 		outword	r3
 		outword	r4
 
-.outsb_no_8:	tst	r2, #4
-		beq	.outsb_no_4
+.Loutsb_no_8:	tst	r2, #4
+		beq	.Loutsb_no_4
 
 		ldr	r3, [r1], #4
 		outword	r3
 
-.outsb_no_4:	ands	r2, r2, #3
-		LOADREGS(eqfd, sp!, {r4, r5, pc})
+.Loutsb_no_4:	ands	r2, r2, #3
+		ldmfdeq	sp!, {r4, r5, pc}
 
 		cmp	r2, #2
 		ldrb	r3, [r1], #1
 		strb	r3, [r0]
-		ldrgeb	r3, [r1], #1
-		strgeb	r3, [r0]
-		ldrgtb	r3, [r1]
-		strgtb	r3, [r0]
+		ldrbge	r3, [r1], #1
+		strbge	r3, [r0]
+		ldrbgt	r3, [r1]
+		strbgt	r3, [r0]
 
-		LOADREGS(fd, sp!, {r4, r5, pc})
+		ldmfd	sp!, {r4, r5, pc}
+ENDPROC(__raw_writesb)

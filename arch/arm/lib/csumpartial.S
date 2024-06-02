@@ -1,11 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/lib/csumpartial.S
  *
  *  Copyright (C) 1995-1998 Russell King
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
@@ -26,7 +23,7 @@ td1	.req	r4	@ save before use
 td2	.req	r5	@ save before use
 td3	.req	lr
 
-.zero:		mov	r0, sum
+.Lzero:		mov	r0, sum
 		add	sp, sp, #4
 		ldr	pc, [sp], #4
 
@@ -34,21 +31,22 @@ td3	.req	lr
 		 * Handle 0 to 7 bytes, with any alignment of source and
 		 * destination pointers.  Note that when we get here, C = 0
 		 */
-.less8:		teq	len, #0			@ check for zero count
-		beq	.zero
+.Lless8:		teq	len, #0			@ check for zero count
+		beq	.Lzero
 
 		/* we must have at least one byte. */
 		tst	buf, #1			@ odd address?
-		ldrneb	td0, [buf], #1
+		movne	sum, sum, ror #8
+		ldrbne	td0, [buf], #1
 		subne	len, len, #1
-		adcnes	sum, sum, td0, put_byte_1
+		adcsne	sum, sum, td0, put_byte_1
 
-.less4:		tst	len, #6
-		beq	.less8_byte
+.Lless4:		tst	len, #6
+		beq	.Lless8_byte
 
 		/* we are now half-word aligned */
 
-.less8_wordlp:
+.Lless8_wordlp:
 #if __LINUX_ARM_ARCH__ >= 4
 		ldrh	td0, [buf], #2
 		sub	len, len, #2
@@ -64,30 +62,30 @@ td3	.req	lr
 #endif
 		adcs	sum, sum, td0
 		tst	len, #6
-		bne	.less8_wordlp
+		bne	.Lless8_wordlp
 
-.less8_byte:	tst	len, #1			@ odd number of bytes
-		ldrneb	td0, [buf], #1		@ include last byte
-		adcnes	sum, sum, td0, put_byte_0	@ update checksum
+.Lless8_byte:	tst	len, #1			@ odd number of bytes
+		ldrbne	td0, [buf], #1		@ include last byte
+		adcsne	sum, sum, td0, put_byte_0	@ update checksum
 
-.done:		adc	r0, sum, #0		@ collect up the last carry
+.Ldone:		adc	r0, sum, #0		@ collect up the last carry
 		ldr	td0, [sp], #4
 		tst	td0, #1			@ check buffer alignment
 		movne	r0, r0, ror #8		@ rotate checksum by 8 bits
 		ldr	pc, [sp], #4		@ return
 
-.not_aligned:	tst	buf, #1			@ odd address
-		ldrneb	td0, [buf], #1		@ make even
+.Lnot_aligned:	tst	buf, #1			@ odd address
+		ldrbne	td0, [buf], #1		@ make even
 		subne	len, len, #1
-		adcnes	sum, sum, td0, put_byte_1	@ update checksum
+		adcsne	sum, sum, td0, put_byte_1	@ update checksum
 
 		tst	buf, #2			@ 32-bit aligned?
 #if __LINUX_ARM_ARCH__ >= 4
-		ldrneh	td0, [buf], #2		@ make 32-bit aligned
+		ldrhne	td0, [buf], #2		@ make 32-bit aligned
 		subne	len, len, #2
 #else
-		ldrneb	td0, [buf], #1
-		ldrneb	ip, [buf], #1
+		ldrbne	td0, [buf], #1
+		ldrbne	ip, [buf], #1
 		subne	len, len, #2
 #ifndef __ARMEB__
 		orrne	td0, td0, ip, lsl #8
@@ -95,17 +93,20 @@ td3	.req	lr
 		orrne	td0, ip, td0, lsl #8
 #endif
 #endif
-		adcnes	sum, sum, td0		@ update checksum
-		mov	pc, lr
+		adcsne	sum, sum, td0		@ update checksum
+		ret	lr
 
 ENTRY(csum_partial)
 		stmfd	sp!, {buf, lr}
 		cmp	len, #8			@ Ensure that we have at least
-		blo	.less8			@ 8 bytes to copy.
+		blo	.Lless8			@ 8 bytes to copy.
+
+		tst	buf, #1
+		movne	sum, sum, ror #8
 
 		adds	sum, sum, #0		@ C = 0
 		tst	buf, #3			@ Test destination alignment
-		blne	.not_aligned		@ aligh destination, return here
+		blne	.Lnot_aligned		@ align destination, return here
 
 1:		bics	ip, len, #31
 		beq	3f
@@ -127,11 +128,12 @@ ENTRY(csum_partial)
 		ldmfd	sp!, {r4 - r5}
 
 3:		tst	len, #0x1c		@ should not change C
-		beq	.less4
+		beq	.Lless4
 
 4:		ldr	td0, [buf], #4
 		sub	len, len, #4
 		adcs	sum, sum, td0
 		tst	len, #0x1c
 		bne	4b
-		b	.less4
+		b	.Lless4
+ENDPROC(csum_partial)

@@ -15,6 +15,8 @@
 #include <linux/types.h>
 #include <linux/jiffies.h>
 #include <linux/timer.h>
+#include <linux/module.h>
+
 #include <asm/amigayle.h>
 #include <asm/amipcmcia.h>
 
@@ -24,16 +26,16 @@ static unsigned char cfg_byte = GAYLE_CFG_0V|GAYLE_CFG_150NS;
 void pcmcia_reset(void)
 {
 	unsigned long reset_start_time = jiffies;
-	unsigned char b;
 
 	gayle_reset = 0x00;
 	while (time_before(jiffies, reset_start_time + 1*HZ/100));
-	b = gayle_reset;
+	READ_ONCE(gayle_reset);
 }
+EXPORT_SYMBOL(pcmcia_reset);
 
 
 /* copy a tuple, including tuple header. return nb bytes copied */
-/* be carefull as this may trigger a GAYLE_IRQ_WR interrupt ! */
+/* be careful as this may trigger a GAYLE_IRQ_WR interrupt ! */
 
 int pcmcia_copy_tuple(unsigned char tuple_id, void *tuple, int max_len)
 {
@@ -61,6 +63,7 @@ int pcmcia_copy_tuple(unsigned char tuple_id, void *tuple, int max_len)
 
 	return 0;
 }
+EXPORT_SYMBOL(pcmcia_copy_tuple);
 
 void pcmcia_program_voltage(int voltage)
 {
@@ -84,6 +87,7 @@ void pcmcia_program_voltage(int voltage)
 	gayle.config = cfg_byte;
 
 }
+EXPORT_SYMBOL(pcmcia_program_voltage);
 
 void pcmcia_access_speed(int speed)
 {
@@ -101,13 +105,17 @@ void pcmcia_access_speed(int speed)
 	cfg_byte = (cfg_byte & 0xf3) | s;
 	gayle.config = cfg_byte;
 }
+EXPORT_SYMBOL(pcmcia_access_speed);
 
 void pcmcia_write_enable(void)
 {
 	gayle.cardstatus = GAYLE_CS_WR|GAYLE_CS_DA;
 }
+EXPORT_SYMBOL(pcmcia_write_enable);
 
 void pcmcia_write_disable(void)
 {
 	gayle.cardstatus = 0;
 }
+EXPORT_SYMBOL(pcmcia_write_disable);
+

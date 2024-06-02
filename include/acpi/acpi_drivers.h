@@ -1,112 +1,93 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *  acpi_drivers.h  ($Revision: 31 $)
  *
  *  Copyright (C) 2001, 2002 Andy Grover <andrew.grover@intel.com>
  *  Copyright (C) 2001, 2002 Paul Diefenbaugh <paul.s.diefenbaugh@intel.com>
- *
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or (at
- *  your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful, but
- *  WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- *  General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
- *
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
 
 #ifndef __ACPI_DRIVERS_H__
 #define __ACPI_DRIVERS_H__
 
-#include <linux/acpi.h>
-#include <acpi/acpi_bus.h>
-
-
 #define ACPI_MAX_STRING			80
 
-#define ACPI_BUS_COMPONENT		0x00010000
-#define ACPI_SYSTEM_COMPONENT		0x02000000
+/*
+ * _HID definitions
+ * HIDs must conform to ACPI spec(6.1.4)
+ * Linux specific HIDs do not apply to this and begin with LNX:
+ */
 
-/* _HID definitions */
+#define ACPI_POWER_HID			"LNXPOWER"
+#define ACPI_PROCESSOR_OBJECT_HID	"LNXCPU"
+#define ACPI_SYSTEM_HID			"LNXSYSTM"
+#define ACPI_THERMAL_HID		"LNXTHERM"
+#define ACPI_BUTTON_HID_POWERF		"LNXPWRBN"
+#define ACPI_BUTTON_HID_SLEEPF		"LNXSLPBN"
+#define ACPI_VIDEO_HID			"LNXVIDEO"
+#define ACPI_BAY_HID			"LNXIOBAY"
+#define ACPI_DOCK_HID			"LNXDOCK"
+#define ACPI_ECDT_HID			"LNXEC"
+/* SMBUS HID definition as supported by Microsoft Windows */
+#define ACPI_SMBUS_MS_HID		"SMB0001"
+/* Quirk for broken IBM BIOSes */
+#define ACPI_SMBUS_IBM_HID		"SMBUSIBM"
 
-#define ACPI_POWER_HID			"ACPI_PWR"
-#define ACPI_PROCESSOR_HID		"ACPI_CPU"
-#define ACPI_SYSTEM_HID			"ACPI_SYS"
-#define ACPI_THERMAL_HID		"ACPI_THM"
-#define ACPI_BUTTON_HID_POWERF		"ACPI_FPB"
-#define ACPI_BUTTON_HID_SLEEPF		"ACPI_FSB"
-
+/*
+ * For fixed hardware buttons, we fabricate acpi_devices with HID
+ * ACPI_BUTTON_HID_POWERF or ACPI_BUTTON_HID_SLEEPF.  Fixed hardware
+ * signals only an event; it doesn't supply a notification value.
+ * To allow drivers to treat notifications from fixed hardware the
+ * same as those from real devices, we turn the events into this
+ * notification value.
+ */
+#define ACPI_FIXED_HARDWARE_EVENT	0x100
 
 /* --------------------------------------------------------------------------
                                        PCI
    -------------------------------------------------------------------------- */
 
-#ifdef CONFIG_ACPI_PCI
 
-#define ACPI_PCI_COMPONENT		0x00400000
+/* ACPI PCI Interrupt Link */
 
-/* ACPI PCI Interrupt Link (pci_link.c) */
+int acpi_irq_penalty_init(void);
+int acpi_pci_link_allocate_irq(acpi_handle handle, int index, int *triggering,
+			       int *polarity, char **name);
+int acpi_pci_link_free_irq(acpi_handle handle);
 
-int acpi_irq_penalty_init (void);
-int acpi_pci_link_get_irq (acpi_handle handle, int index, int *edge_level,
-	int *active_high_low, char **name);
-
-/* ACPI PCI Interrupt Routing (pci_irq.c) */
-
-int acpi_pci_irq_add_prt (acpi_handle handle, int segment, int bus);
-void acpi_pci_irq_del_prt (int segment, int bus);
-
-/* ACPI PCI Device Binding (pci_bind.c) */
+/* ACPI PCI Device Binding */
 
 struct pci_bus;
 
-int acpi_pci_bind (struct acpi_device *device);
-int acpi_pci_unbind (struct acpi_device *device);
-int acpi_pci_bind_root (struct acpi_device *device, struct acpi_pci_id *id, struct pci_bus *bus);
+#ifdef CONFIG_PCI
+struct pci_dev *acpi_get_pci_dev(acpi_handle);
+#else
+static inline struct pci_dev *acpi_get_pci_dev(acpi_handle handle)
+{
+	return NULL;
+}
+#endif
 
 /* Arch-defined function to add a bus to the system */
 
-struct pci_bus *pci_acpi_scan_root(struct acpi_device *device, int domain, int bus);
+struct pci_bus *pci_acpi_scan_root(struct acpi_pci_root *root);
 
-#endif /*CONFIG_ACPI_PCI*/
-
-
-/* --------------------------------------------------------------------------
-                                  Power Resource
-   -------------------------------------------------------------------------- */
-
-#ifdef CONFIG_ACPI_POWER
-int acpi_enable_wakeup_device_power (struct acpi_device *dev);
-int acpi_disable_wakeup_device_power (struct acpi_device *dev);
-int acpi_power_get_inferred_state (struct acpi_device *device);
-int acpi_power_transition (struct acpi_device *device, int state);
+#ifdef CONFIG_X86
+void pci_acpi_crs_quirks(void);
+#else
+static inline void pci_acpi_crs_quirks(void) { }
 #endif
 
+/*--------------------------------------------------------------------------
+                                  Dock Station
+  -------------------------------------------------------------------------- */
 
-/* --------------------------------------------------------------------------
-                                  Embedded Controller
-   -------------------------------------------------------------------------- */
-#ifdef CONFIG_ACPI_EC
-int acpi_ec_ecdt_probe (void);
-#endif
-
-/* --------------------------------------------------------------------------
-                                    Processor
-   -------------------------------------------------------------------------- */
-
-#define ACPI_PROCESSOR_LIMIT_NONE	0x00
-#define ACPI_PROCESSOR_LIMIT_INCREMENT	0x01
-#define ACPI_PROCESSOR_LIMIT_DECREMENT	0x02
-
-int acpi_processor_set_thermal_limit(acpi_handle handle, int type);
-
+#ifdef CONFIG_ACPI_DOCK
+extern int is_dock_device(struct acpi_device *adev);
+#else
+static inline int is_dock_device(struct acpi_device *adev)
+{
+	return 0;
+}
+#endif /* CONFIG_ACPI_DOCK */
 
 #endif /*__ACPI_DRIVERS_H__*/

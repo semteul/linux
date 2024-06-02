@@ -1,10 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * $Id: mtd_blkdevs.c,v 1.24 2004/11/16 18:28:59 dwmw2 Exp $
+ * Interface to Linux block layer for MTD 'translation layers'.
  *
- * (C) 2003 David Woodhouse <dwmw2@infradead.org>
- *
- * Interface to Linux 2.5 block layer for MTD 'translation layers'.
- *
+ * Copyright © 2003-2010 David Woodhouse <dwmw2@infradead.org>
  */
 
 #include <linux/kernel.h>
@@ -15,241 +13,278 @@
 #include <linux/mtd/blktrans.h>
 #include <linux/mtd/mtd.h>
 #include <linux/blkdev.h>
+#include <linux/blk-mq.h>
 #include <linux/blkpg.h>
 #include <linux/spinlock.h>
 #include <linux/hdreg.h>
-#include <linux/init.h>
-#include <asm/semaphore.h>
-#include <asm/uaccess.h>
-#include <linux/devfs_fs_kernel.h>
+#include <linux/mutex.h>
+#include <linux/uaccess.h>
+
+#include "mtdcore.h"
 
 static LIST_HEAD(blktrans_majors);
 
-extern struct semaphore mtd_table_mutex;
-extern struct mtd_info *mtd_table[];
+static void blktrans_dev_release(struct kref *kref)
+{
+	struct mtd_blktrans_dev *dev =
+		container_of(kref, struct mtd_blktrans_dev, ref);
 
-struct mtd_blkcore_priv {
-	struct completion thread_dead;
-	int exiting;
-	wait_queue_head_t thread_wq;
-	struct request_queue *rq;
-	spinlock_t queue_lock;
-};
+	put_disk(dev->disk);
+	blk_mq_free_tag_set(dev->tag_set);
+	kfree(dev->tag_set);
+	list_del(&dev->list);
+	kfree(dev);
+}
 
-static int do_blktrans_request(struct mtd_blktrans_ops *tr,
+static void blktrans_dev_put(struct mtd_blktrans_dev *dev)
+{
+	kref_put(&dev->ref, blktrans_dev_release);
+}
+
+
+static blk_status_t do_blktrans_request(struct mtd_blktrans_ops *tr,
 			       struct mtd_blktrans_dev *dev,
 			       struct request *req)
 {
+	struct req_iterator iter;
+	struct bio_vec bvec;
 	unsigned long block, nsect;
 	char *buf;
 
-	block = req->sector;
-	nsect = req->current_nr_sectors;
-	buf = req->buffer;
+	block = blk_rq_pos(req) << 9 >> tr->blkshift;
+	nsect = blk_rq_cur_bytes(req) >> tr->blkshift;
 
-	if (!(req->flags & REQ_CMD))
-		return 0;
+	switch (req_op(req)) {
+	case REQ_OP_FLUSH:
+		if (tr->flush(dev))
+			return BLK_STS_IOERR;
+		return BLK_STS_OK;
+	case REQ_OP_DISCARD:
+		if (tr->discard(dev, block, nsect))
+			return BLK_STS_IOERR;
+		return BLK_STS_OK;
+	case REQ_OP_READ:
+		buf = kmap(bio_page(req->bio)) + bio_offset(req->bio);
+		for (; nsect > 0; nsect--, block++, buf += tr->blksize) {
+			if (tr->readsect(dev, block, buf)) {
+				kunmap(bio_page(req->bio));
+				return BLK_STS_IOERR;
+			}
+		}
+		kunmap(bio_page(req->bio));
 
-	if (block + nsect > get_capacity(req->rq_disk))
-		return 0;
-
-	switch(rq_data_dir(req)) {
-	case READ:
-		for (; nsect > 0; nsect--, block++, buf += 512)
-			if (tr->readsect(dev, block, buf))
-				return 0;
-		return 1;
-
-	case WRITE:
+		rq_for_each_segment(bvec, req, iter)
+			flush_dcache_page(bvec.bv_page);
+		return BLK_STS_OK;
+	case REQ_OP_WRITE:
 		if (!tr->writesect)
-			return 0;
+			return BLK_STS_IOERR;
 
-		for (; nsect > 0; nsect--, block++, buf += 512)
-			if (tr->writesect(dev, block, buf))
-				return 0;
-		return 1;
+		rq_for_each_segment(bvec, req, iter)
+			flush_dcache_page(bvec.bv_page);
 
+		buf = kmap(bio_page(req->bio)) + bio_offset(req->bio);
+		for (; nsect > 0; nsect--, block++, buf += tr->blksize) {
+			if (tr->writesect(dev, block, buf)) {
+				kunmap(bio_page(req->bio));
+				return BLK_STS_IOERR;
+			}
+		}
+		kunmap(bio_page(req->bio));
+		return BLK_STS_OK;
 	default:
-		printk(KERN_NOTICE "Unknown request %ld\n", rq_data_dir(req));
-		return 0;
+		return BLK_STS_IOERR;
 	}
 }
 
-static int mtd_blktrans_thread(void *arg)
+int mtd_blktrans_cease_background(struct mtd_blktrans_dev *dev)
 {
-	struct mtd_blktrans_ops *tr = arg;
-	struct request_queue *rq = tr->blkcore_priv->rq;
+	return dev->bg_stop;
+}
+EXPORT_SYMBOL_GPL(mtd_blktrans_cease_background);
 
-	/* we might get involved when memory gets low, so use PF_MEMALLOC */
-	current->flags |= PF_MEMALLOC | PF_NOFREEZE;
+static struct request *mtd_next_request(struct mtd_blktrans_dev *dev)
+{
+	struct request *rq;
 
-	daemonize("%sd", tr->name);
+	rq = list_first_entry_or_null(&dev->rq_list, struct request, queuelist);
+	if (rq) {
+		list_del_init(&rq->queuelist);
+		blk_mq_start_request(rq);
+		return rq;
+	}
 
-	/* daemonize() doesn't do this for us since some kernel threads
-	   actually want to deal with signals. We can't just call 
-	   exit_sighand() since that'll cause an oops when we finally
-	   do exit. */
-	spin_lock_irq(&current->sighand->siglock);
-	sigfillset(&current->blocked);
-	recalc_sigpending();
-	spin_unlock_irq(&current->sighand->siglock);
+	return NULL;
+}
 
-	spin_lock_irq(rq->queue_lock);
-		
-	while (!tr->blkcore_priv->exiting) {
-		struct request *req;
-		struct mtd_blktrans_dev *dev;
-		int res = 0;
-		DECLARE_WAITQUEUE(wait, current);
+static void mtd_blktrans_work(struct mtd_blktrans_dev *dev)
+	__releases(&dev->queue_lock)
+	__acquires(&dev->queue_lock)
+{
+	struct mtd_blktrans_ops *tr = dev->tr;
+	struct request *req = NULL;
+	int background_done = 0;
 
-		req = elv_next_request(rq);
+	while (1) {
+		blk_status_t res;
 
-		if (!req) {
-			add_wait_queue(&tr->blkcore_priv->thread_wq, &wait);
-			set_current_state(TASK_INTERRUPTIBLE);
-
-			spin_unlock_irq(rq->queue_lock);
-
-			schedule();
-			remove_wait_queue(&tr->blkcore_priv->thread_wq, &wait);
-
-			spin_lock_irq(rq->queue_lock);
-
-			continue;
+		dev->bg_stop = false;
+		if (!req && !(req = mtd_next_request(dev))) {
+			if (tr->background && !background_done) {
+				spin_unlock_irq(&dev->queue_lock);
+				mutex_lock(&dev->lock);
+				tr->background(dev);
+				mutex_unlock(&dev->lock);
+				spin_lock_irq(&dev->queue_lock);
+				/*
+				 * Do background processing just once per idle
+				 * period.
+				 */
+				background_done = !dev->bg_stop;
+				continue;
+			}
+			break;
 		}
 
-		dev = req->rq_disk->private_data;
-		tr = dev->tr;
+		spin_unlock_irq(&dev->queue_lock);
 
-		spin_unlock_irq(rq->queue_lock);
+		mutex_lock(&dev->lock);
+		res = do_blktrans_request(dev->tr, dev, req);
+		mutex_unlock(&dev->lock);
 
-		down(&dev->sem);
-		res = do_blktrans_request(tr, dev, req);
-		up(&dev->sem);
+		if (!blk_update_request(req, res, blk_rq_cur_bytes(req))) {
+			__blk_mq_end_request(req, res);
+			req = NULL;
+		}
 
-		spin_lock_irq(rq->queue_lock);
-
-		end_request(req, res);
+		background_done = 0;
+		cond_resched();
+		spin_lock_irq(&dev->queue_lock);
 	}
-	spin_unlock_irq(rq->queue_lock);
-
-	complete_and_exit(&tr->blkcore_priv->thread_dead, 0);
 }
 
-static void mtd_blktrans_request(struct request_queue *rq)
-{
-	struct mtd_blktrans_ops *tr = rq->queuedata;
-	wake_up(&tr->blkcore_priv->thread_wq);
-}
-
-
-static int blktrans_open(struct inode *i, struct file *f)
+static blk_status_t mtd_queue_rq(struct blk_mq_hw_ctx *hctx,
+				 const struct blk_mq_queue_data *bd)
 {
 	struct mtd_blktrans_dev *dev;
-	struct mtd_blktrans_ops *tr;
-	int ret = -ENODEV;
 
-	dev = i->i_bdev->bd_disk->private_data;
-	tr = dev->tr;
-
-	if (!try_module_get(dev->mtd->owner))
-		goto out;
-
-	if (!try_module_get(tr->owner))
-		goto out_tr;
-
-	/* FIXME: Locking. A hot pluggable device can go away 
-	   (del_mtd_device can be called for it) without its module
-	   being unloaded. */
-	dev->mtd->usecount++;
-
-	ret = 0;
-	if (tr->open && (ret = tr->open(dev))) {
-		dev->mtd->usecount--;
-		module_put(dev->mtd->owner);
-	out_tr:
-		module_put(tr->owner);
+	dev = hctx->queue->queuedata;
+	if (!dev) {
+		blk_mq_start_request(bd->rq);
+		return BLK_STS_IOERR;
 	}
- out:
-	return ret;
+
+	spin_lock_irq(&dev->queue_lock);
+	list_add_tail(&bd->rq->queuelist, &dev->rq_list);
+	mtd_blktrans_work(dev);
+	spin_unlock_irq(&dev->queue_lock);
+
+	return BLK_STS_OK;
 }
 
-static int blktrans_release(struct inode *i, struct file *f)
+static int blktrans_open(struct gendisk *disk, blk_mode_t mode)
 {
-	struct mtd_blktrans_dev *dev;
-	struct mtd_blktrans_ops *tr;
+	struct mtd_blktrans_dev *dev = disk->private_data;
 	int ret = 0;
 
-	dev = i->i_bdev->bd_disk->private_data;
-	tr = dev->tr;
+	kref_get(&dev->ref);
 
-	if (tr->release)
-		ret = tr->release(dev);
+	mutex_lock(&dev->lock);
 
-	if (!ret) {
-		dev->mtd->usecount--;
-		module_put(dev->mtd->owner);
-		module_put(tr->owner);
+	if (dev->open)
+		goto unlock;
+
+	__module_get(dev->tr->owner);
+
+	if (!dev->mtd)
+		goto unlock;
+
+	if (dev->tr->open) {
+		ret = dev->tr->open(dev);
+		if (ret)
+			goto error_put;
 	}
 
+	ret = __get_mtd_device(dev->mtd);
+	if (ret)
+		goto error_release;
+	dev->writable = mode & BLK_OPEN_WRITE;
+
+unlock:
+	dev->open++;
+	mutex_unlock(&dev->lock);
+	return ret;
+
+error_release:
+	if (dev->tr->release)
+		dev->tr->release(dev);
+error_put:
+	module_put(dev->tr->owner);
+	mutex_unlock(&dev->lock);
+	blktrans_dev_put(dev);
 	return ret;
 }
 
-
-static int blktrans_ioctl(struct inode *inode, struct file *file, 
-			      unsigned int cmd, unsigned long arg)
+static void blktrans_release(struct gendisk *disk)
 {
-	struct mtd_blktrans_dev *dev = inode->i_bdev->bd_disk->private_data;
-	struct mtd_blktrans_ops *tr = dev->tr;
+	struct mtd_blktrans_dev *dev = disk->private_data;
 
-	switch (cmd) {
-	case BLKFLSBUF:
-		if (tr->flush)
-			return tr->flush(dev);
-		/* The core code did the work, we had nothing to do. */
-		return 0;
+	mutex_lock(&dev->lock);
 
-	case HDIO_GETGEO:
-		if (tr->getgeo) {
-			struct hd_geometry g;
-			int ret;
+	if (--dev->open)
+		goto unlock;
 
-			memset(&g, 0, sizeof(g));
-			ret = tr->getgeo(dev, &g);
-			if (ret)
-				return ret;
+	module_put(dev->tr->owner);
 
-			g.start = get_start_sect(inode->i_bdev);
-			if (copy_to_user((void __user *)arg, &g, sizeof(g)))
-				return -EFAULT;
-			return 0;
-		} /* else */
-	default:
-		return -ENOTTY;
+	if (dev->mtd) {
+		if (dev->tr->release)
+			dev->tr->release(dev);
+		__put_mtd_device(dev->mtd);
 	}
+unlock:
+	mutex_unlock(&dev->lock);
+	blktrans_dev_put(dev);
 }
 
-struct block_device_operations mtd_blktrans_ops = {
+static int blktrans_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+{
+	struct mtd_blktrans_dev *dev = bdev->bd_disk->private_data;
+	int ret = -ENXIO;
+
+	mutex_lock(&dev->lock);
+
+	if (!dev->mtd)
+		goto unlock;
+
+	ret = dev->tr->getgeo ? dev->tr->getgeo(dev, geo) : -ENOTTY;
+unlock:
+	mutex_unlock(&dev->lock);
+	return ret;
+}
+
+static const struct block_device_operations mtd_block_ops = {
 	.owner		= THIS_MODULE,
 	.open		= blktrans_open,
 	.release	= blktrans_release,
-	.ioctl		= blktrans_ioctl,
+	.getgeo		= blktrans_getgeo,
+};
+
+static const struct blk_mq_ops mtd_mq_ops = {
+	.queue_rq	= mtd_queue_rq,
 };
 
 int add_mtd_blktrans_dev(struct mtd_blktrans_dev *new)
 {
 	struct mtd_blktrans_ops *tr = new->tr;
-	struct list_head *this;
+	struct mtd_blktrans_dev *d;
+	struct queue_limits lim = { };
 	int last_devnum = -1;
 	struct gendisk *gd;
+	int ret;
 
-	if (!down_trylock(&mtd_table_mutex)) {
-		up(&mtd_table_mutex);
-		BUG();
-	}
+	lockdep_assert_held(&mtd_table_mutex);
 
-	list_for_each(this, &tr->devs) {
-		struct mtd_blktrans_dev *d = list_entry(this, struct mtd_blktrans_dev, list);
+	list_for_each_entry(d, &tr->devs, list) {
 		if (new->devnum == -1) {
 			/* Use first free number */
 			if (d->devnum != last_devnum+1) {
@@ -265,196 +300,229 @@ int add_mtd_blktrans_dev(struct mtd_blktrans_dev *new)
 			/* Required number was free */
 			list_add_tail(&new->list, &d->list);
 			goto added;
-		} 
+		}
 		last_devnum = d->devnum;
 	}
+
+	ret = -EBUSY;
 	if (new->devnum == -1)
 		new->devnum = last_devnum+1;
 
-	if ((new->devnum << tr->part_bits) > 256) {
-		return -EBUSY;
-	}
+	/* Check that the device and any partitions will get valid
+	 * minor numbers and that the disk naming code below can cope
+	 * with this number. */
+	if (new->devnum > (MINORMASK >> tr->part_bits) ||
+	    (tr->part_bits && new->devnum >= 27 * 26))
+		return ret;
 
-	init_MUTEX(&new->sem);
 	list_add_tail(&new->list, &tr->devs);
  added:
+
+	mutex_init(&new->lock);
+	kref_init(&new->ref);
 	if (!tr->writesect)
 		new->readonly = 1;
 
-	gd = alloc_disk(1 << tr->part_bits);
-	if (!gd) {
-		list_del(&new->list);
-		return -ENOMEM;
+	ret = -ENOMEM;
+	new->tag_set = kzalloc(sizeof(*new->tag_set), GFP_KERNEL);
+	if (!new->tag_set)
+		goto out_list_del;
+
+	ret = blk_mq_alloc_sq_tag_set(new->tag_set, &mtd_mq_ops, 2,
+			BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_BLOCKING);
+	if (ret)
+		goto out_kfree_tag_set;
+	
+	lim.logical_block_size = tr->blksize;
+	if (tr->discard)
+		lim.max_hw_discard_sectors = UINT_MAX;
+
+	/* Create gendisk */
+	gd = blk_mq_alloc_disk(new->tag_set, &lim, new);
+	if (IS_ERR(gd)) {
+		ret = PTR_ERR(gd);
+		goto out_free_tag_set;
 	}
+
+	new->disk = gd;
+	new->rq = new->disk->queue;
+	gd->private_data = new;
 	gd->major = tr->major;
 	gd->first_minor = (new->devnum) << tr->part_bits;
-	gd->fops = &mtd_blktrans_ops;
-	
-	snprintf(gd->disk_name, sizeof(gd->disk_name),
-		 "%s%c", tr->name, (tr->part_bits?'a':'0') + new->devnum);
-	snprintf(gd->devfs_name, sizeof(gd->devfs_name),
-		 "%s/%c", tr->name, (tr->part_bits?'a':'0') + new->devnum);
+	gd->minors = 1 << tr->part_bits;
+	gd->fops = &mtd_block_ops;
 
-	/* 2.5 has capacity in units of 512 bytes while still
-	   having BLOCK_SIZE_BITS set to 10. Just to keep us amused. */
-	set_capacity(gd, (new->size * new->blksize) >> 9);
+	if (tr->part_bits) {
+		if (new->devnum < 26)
+			snprintf(gd->disk_name, sizeof(gd->disk_name),
+				 "%s%c", tr->name, 'a' + new->devnum);
+		else
+			snprintf(gd->disk_name, sizeof(gd->disk_name),
+				 "%s%c%c", tr->name,
+				 'a' - 1 + new->devnum / 26,
+				 'a' + new->devnum % 26);
+	} else {
+		snprintf(gd->disk_name, sizeof(gd->disk_name),
+			 "%s%d", tr->name, new->devnum);
+		gd->flags |= GENHD_FL_NO_PART;
+	}
 
-	gd->private_data = new;
-	new->blkcore_priv = gd;
-	gd->queue = tr->blkcore_priv->rq;
+	set_capacity(gd, ((u64)new->size * tr->blksize) >> 9);
+
+	/* Create the request queue */
+	spin_lock_init(&new->queue_lock);
+	INIT_LIST_HEAD(&new->rq_list);
+
+	if (tr->flush)
+		blk_queue_write_cache(new->rq, true, false);
+
+	blk_queue_flag_set(QUEUE_FLAG_NONROT, new->rq);
+	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, new->rq);
+
+	gd->queue = new->rq;
 
 	if (new->readonly)
 		set_disk_ro(gd, 1);
 
-	add_disk(gd);
-	
+	ret = device_add_disk(&new->mtd->dev, gd, NULL);
+	if (ret)
+		goto out_cleanup_disk;
+
+	if (new->disk_attributes) {
+		ret = sysfs_create_group(&disk_to_dev(gd)->kobj,
+					new->disk_attributes);
+		WARN_ON(ret);
+	}
 	return 0;
+
+out_cleanup_disk:
+	put_disk(new->disk);
+out_free_tag_set:
+	blk_mq_free_tag_set(new->tag_set);
+out_kfree_tag_set:
+	kfree(new->tag_set);
+out_list_del:
+	list_del(&new->list);
+	return ret;
 }
 
 int del_mtd_blktrans_dev(struct mtd_blktrans_dev *old)
 {
-	if (!down_trylock(&mtd_table_mutex)) {
-		up(&mtd_table_mutex);
-		BUG();
+	unsigned long flags;
+
+	lockdep_assert_held(&mtd_table_mutex);
+
+	if (old->disk_attributes)
+		sysfs_remove_group(&disk_to_dev(old->disk)->kobj,
+						old->disk_attributes);
+
+	/* Stop new requests to arrive */
+	del_gendisk(old->disk);
+
+	/* Kill current requests */
+	spin_lock_irqsave(&old->queue_lock, flags);
+	old->rq->queuedata = NULL;
+	spin_unlock_irqrestore(&old->queue_lock, flags);
+
+	/* freeze+quiesce queue to ensure all requests are flushed */
+	blk_mq_freeze_queue(old->rq);
+	blk_mq_quiesce_queue(old->rq);
+	blk_mq_unquiesce_queue(old->rq);
+	blk_mq_unfreeze_queue(old->rq);
+
+	/* If the device is currently open, tell trans driver to close it,
+		then put mtd device, and don't touch it again */
+	mutex_lock(&old->lock);
+	if (old->open) {
+		if (old->tr->release)
+			old->tr->release(old);
+		__put_mtd_device(old->mtd);
 	}
 
-	list_del(&old->list);
+	old->mtd = NULL;
 
-	del_gendisk(old->blkcore_priv);
-	put_disk(old->blkcore_priv);
-		
+	mutex_unlock(&old->lock);
+	blktrans_dev_put(old);
 	return 0;
 }
 
 static void blktrans_notify_remove(struct mtd_info *mtd)
 {
-	struct list_head *this, *this2, *next;
+	struct mtd_blktrans_ops *tr;
+	struct mtd_blktrans_dev *dev, *next;
 
-	list_for_each(this, &blktrans_majors) {
-		struct mtd_blktrans_ops *tr = list_entry(this, struct mtd_blktrans_ops, list);
-
-		list_for_each_safe(this2, next, &tr->devs) {
-			struct mtd_blktrans_dev *dev = list_entry(this2, struct mtd_blktrans_dev, list);
-
+	list_for_each_entry(tr, &blktrans_majors, list)
+		list_for_each_entry_safe(dev, next, &tr->devs, list)
 			if (dev->mtd == mtd)
 				tr->remove_dev(dev);
-		}
-	}
 }
 
 static void blktrans_notify_add(struct mtd_info *mtd)
 {
-	struct list_head *this;
+	struct mtd_blktrans_ops *tr;
 
-	if (mtd->type == MTD_ABSENT)
+	if (mtd->type == MTD_ABSENT || mtd->type == MTD_UBIVOLUME)
 		return;
 
-	list_for_each(this, &blktrans_majors) {
-		struct mtd_blktrans_ops *tr = list_entry(this, struct mtd_blktrans_ops, list);
-
+	list_for_each_entry(tr, &blktrans_majors, list)
 		tr->add_mtd(tr, mtd);
-	}
-
 }
 
 static struct mtd_notifier blktrans_notifier = {
 	.add = blktrans_notify_add,
 	.remove = blktrans_notify_remove,
 };
-      
+
 int register_mtd_blktrans(struct mtd_blktrans_ops *tr)
 {
-	int ret, i;
+	struct mtd_info *mtd;
+	int ret;
 
-	/* Register the notifier if/when the first device type is 
+	/* Register the notifier if/when the first device type is
 	   registered, to prevent the link/init ordering from fucking
 	   us over. */
 	if (!blktrans_notifier.list.next)
 		register_mtd_user(&blktrans_notifier);
 
-	tr->blkcore_priv = kmalloc(sizeof(*tr->blkcore_priv), GFP_KERNEL);
-	if (!tr->blkcore_priv)
-		return -ENOMEM;
-
-	memset(tr->blkcore_priv, 0, sizeof(*tr->blkcore_priv));
-
-	down(&mtd_table_mutex);
-
 	ret = register_blkdev(tr->major, tr->name);
-	if (ret) {
+	if (ret < 0) {
 		printk(KERN_WARNING "Unable to register %s block device on major %d: %d\n",
 		       tr->name, tr->major, ret);
-		kfree(tr->blkcore_priv);
-		up(&mtd_table_mutex);
 		return ret;
 	}
-	spin_lock_init(&tr->blkcore_priv->queue_lock);
-	init_completion(&tr->blkcore_priv->thread_dead);
-	init_waitqueue_head(&tr->blkcore_priv->thread_wq);
 
-	tr->blkcore_priv->rq = blk_init_queue(mtd_blktrans_request, &tr->blkcore_priv->queue_lock);
-	if (!tr->blkcore_priv->rq) {
-		unregister_blkdev(tr->major, tr->name);
-		kfree(tr->blkcore_priv);
-		up(&mtd_table_mutex);
-		return -ENOMEM;
-	}
+	if (ret)
+		tr->major = ret;
 
-	tr->blkcore_priv->rq->queuedata = tr;
-
-	ret = kernel_thread(mtd_blktrans_thread, tr, CLONE_KERNEL);
-	if (ret < 0) {
-		blk_cleanup_queue(tr->blkcore_priv->rq);
-		unregister_blkdev(tr->major, tr->name);
-		kfree(tr->blkcore_priv);
-		up(&mtd_table_mutex);
-		return ret;
-	} 
-
-	devfs_mk_dir(tr->name);
+	tr->blkshift = ffs(tr->blksize) - 1;
 
 	INIT_LIST_HEAD(&tr->devs);
+
+	mutex_lock(&mtd_table_mutex);
 	list_add(&tr->list, &blktrans_majors);
-
-	for (i=0; i<MAX_MTD_DEVICES; i++) {
-		if (mtd_table[i] && mtd_table[i]->type != MTD_ABSENT)
-			tr->add_mtd(tr, mtd_table[i]);
-	}
-
-	up(&mtd_table_mutex);
-
+	mtd_for_each_device(mtd)
+		if (mtd->type != MTD_ABSENT && mtd->type != MTD_UBIVOLUME)
+			tr->add_mtd(tr, mtd);
+	mutex_unlock(&mtd_table_mutex);
 	return 0;
 }
 
 int deregister_mtd_blktrans(struct mtd_blktrans_ops *tr)
 {
-	struct list_head *this, *next;
+	struct mtd_blktrans_dev *dev, *next;
 
-	down(&mtd_table_mutex);
-
-	/* Clean up the kernel thread */
-	tr->blkcore_priv->exiting = 1;
-	wake_up(&tr->blkcore_priv->thread_wq);
-	wait_for_completion(&tr->blkcore_priv->thread_dead);
+	mutex_lock(&mtd_table_mutex);
 
 	/* Remove it from the list of active majors */
 	list_del(&tr->list);
 
-	list_for_each_safe(this, next, &tr->devs) {
-		struct mtd_blktrans_dev *dev = list_entry(this, struct mtd_blktrans_dev, list);
+	list_for_each_entry_safe(dev, next, &tr->devs, list)
 		tr->remove_dev(dev);
-	}
 
-	devfs_remove(tr->name);
-	blk_cleanup_queue(tr->blkcore_priv->rq);
+	mutex_unlock(&mtd_table_mutex);
 	unregister_blkdev(tr->major, tr->name);
 
-	up(&mtd_table_mutex);
-
-	kfree(tr->blkcore_priv);
-
-	if (!list_empty(&tr->devs))
-		BUG();
+	BUG_ON(!list_empty(&tr->devs));
 	return 0;
 }
 

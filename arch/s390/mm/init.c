@@ -1,15 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- *  arch/s390/mm/init.c
- *
  *  S390 version
- *    Copyright (C) 1999 IBM Deutschland Entwicklung GmbH, IBM Corporation
+ *    Copyright IBM Corp. 1999
  *    Author(s): Hartmut Penner (hp@de.ibm.com)
  *
  *  Derived from "arch/i386/mm/init.c"
  *    Copyright (C) 1995  Linus Torvalds
  */
 
-#include <linux/config.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
 #include <linux/kernel.h>
@@ -20,296 +18,317 @@
 #include <linux/mman.h>
 #include <linux/mm.h>
 #include <linux/swap.h>
+#include <linux/swiotlb.h>
 #include <linux/smp.h>
 #include <linux/init.h>
 #include <linux/pagemap.h>
-#include <linux/bootmem.h>
-
+#include <linux/memblock.h>
+#include <linux/memory.h>
+#include <linux/pfn.h>
+#include <linux/poison.h>
+#include <linux/initrd.h>
+#include <linux/export.h>
+#include <linux/cma.h>
+#include <linux/gfp.h>
+#include <linux/dma-direct.h>
+#include <linux/percpu.h>
 #include <asm/processor.h>
-#include <asm/system.h>
-#include <asm/uaccess.h>
-#include <asm/pgtable.h>
+#include <linux/uaccess.h>
 #include <asm/pgalloc.h>
+#include <asm/ctlreg.h>
+#include <asm/kfence.h>
 #include <asm/dma.h>
-#include <asm/lowcore.h>
+#include <asm/abs_lowcore.h>
 #include <asm/tlb.h>
 #include <asm/tlbflush.h>
+#include <asm/sections.h>
+#include <asm/sclp.h>
+#include <asm/set_memory.h>
+#include <asm/kasan.h>
+#include <asm/dma-mapping.h>
+#include <asm/uv.h>
+#include <linux/virtio_anchor.h>
+#include <linux/virtio_config.h>
+#include <linux/execmem.h>
 
-DEFINE_PER_CPU(struct mmu_gather, mmu_gathers);
+pgd_t swapper_pg_dir[PTRS_PER_PGD] __section(".bss..swapper_pg_dir");
+pgd_t invalid_pg_dir[PTRS_PER_PGD] __section(".bss..invalid_pg_dir");
 
-pgd_t swapper_pg_dir[PTRS_PER_PGD] __attribute__((__aligned__(PAGE_SIZE)));
-char  empty_zero_page[PAGE_SIZE] __attribute__((__aligned__(PAGE_SIZE)));
+struct ctlreg __bootdata_preserved(s390_invalid_asce);
 
-void diag10(unsigned long addr)
+unsigned long empty_zero_page, zero_page_mask;
+EXPORT_SYMBOL(empty_zero_page);
+EXPORT_SYMBOL(zero_page_mask);
+
+static void __init setup_zero_pages(void)
 {
-        if (addr >= 0x7ff00000)
-                return;
-#ifdef __s390x__
-        asm volatile (
-		"   sam31\n"
-		"   diag %0,%0,0x10\n"
-		"0: sam64\n"
-		".section __ex_table,\"a\"\n"
-		"   .align 8\n"
-		"   .quad 0b, 0b\n"
-		".previous\n"
-		: : "a" (addr));
-#else
-        asm volatile (
-		"   diag %0,%0,0x10\n"
-		"0:\n"
-		".section __ex_table,\"a\"\n"
-		"   .align 4\n"
-		"   .long 0b, 0b\n"
-		".previous\n"
-		: : "a" (addr));
-#endif
+	unsigned int order;
+	struct page *page;
+	int i;
+
+	/* Latest machines require a mapping granularity of 512KB */
+	order = 7;
+
+	/* Limit number of empty zero pages for small memory sizes */
+	while (order > 2 && (totalram_pages() >> 10) < (1UL << order))
+		order--;
+
+	empty_zero_page = __get_free_pages(GFP_KERNEL | __GFP_ZERO, order);
+	if (!empty_zero_page)
+		panic("Out of memory in setup_zero_pages");
+
+	page = virt_to_page((void *) empty_zero_page);
+	split_page(page, order);
+	for (i = 1 << order; i > 0; i--) {
+		mark_page_reserved(page);
+		page++;
+	}
+
+	zero_page_mask = ((PAGE_SIZE << order) - 1) & PAGE_MASK;
 }
 
-void show_mem(void)
-{
-        int i, total = 0, reserved = 0;
-        int shared = 0, cached = 0;
-
-        printk("Mem-info:\n");
-        show_free_areas();
-        printk("Free swap:       %6ldkB\n", nr_swap_pages<<(PAGE_SHIFT-10));
-        i = max_mapnr;
-        while (i-- > 0) {
-                total++;
-                if (PageReserved(mem_map+i))
-                        reserved++;
-                else if (PageSwapCache(mem_map+i))
-                        cached++;
-                else if (page_count(mem_map+i))
-                        shared += page_count(mem_map+i) - 1;
-        }
-        printk("%d pages of RAM\n",total);
-        printk("%d reserved pages\n",reserved);
-        printk("%d pages shared\n",shared);
-        printk("%d pages swap cached\n",cached);
-}
-
-/* References to section boundaries */
-
-extern unsigned long _text;
-extern unsigned long _etext;
-extern unsigned long _edata;
-extern unsigned long __bss_start;
-extern unsigned long _end;
-
-extern unsigned long __init_begin;
-extern unsigned long __init_end;
-
-extern unsigned long __initdata zholes_size[];
 /*
  * paging_init() sets up the page tables
  */
-
-#ifndef CONFIG_ARCH_S390X
 void __init paging_init(void)
 {
-        pgd_t * pg_dir;
-        pte_t * pg_table;
-        pte_t   pte;
-	int     i;
-        unsigned long tmp;
-        unsigned long pfn = 0;
-        unsigned long pgdir_k = (__pa(swapper_pg_dir) & PAGE_MASK) | _KERNSEG_TABLE;
-        static const int ssm_mask = 0x04000000L;
+	unsigned long max_zone_pfns[MAX_NR_ZONES];
 
-	/* unmap whole virtual address space */
-	
-        pg_dir = swapper_pg_dir;
-
-	for (i=0;i<KERNEL_PGD_PTRS;i++) 
-	        pmd_clear((pmd_t*)pg_dir++);
-		
-	/*
-	 * map whole physical memory to virtual memory (identity mapping) 
-	 */
-
-        pg_dir = swapper_pg_dir;
-
-        while (pfn < max_low_pfn) {
-                /*
-                 * pg_table is physical at this point
-                 */
-		pg_table = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
-
-                pg_dir->pgd0 =  (_PAGE_TABLE | __pa(pg_table));
-                pg_dir->pgd1 =  (_PAGE_TABLE | (__pa(pg_table)+1024));
-                pg_dir->pgd2 =  (_PAGE_TABLE | (__pa(pg_table)+2048));
-                pg_dir->pgd3 =  (_PAGE_TABLE | (__pa(pg_table)+3072));
-                pg_dir++;
-
-                for (tmp = 0 ; tmp < PTRS_PER_PTE ; tmp++,pg_table++) {
-                        pte = pfn_pte(pfn, PAGE_KERNEL);
-                        if (pfn >= max_low_pfn)
-                                pte_clear(&init_mm, 0, &pte);
-                        set_pte(pg_table, pte);
-                        pfn++;
-                }
-        }
-
-	S390_lowcore.kernel_asce = pgdir_k;
-
-        /* enable virtual mapping in kernel mode */
-        __asm__ __volatile__("    LCTL  1,1,%0\n"
-                             "    LCTL  7,7,%0\n"
-                             "    LCTL  13,13,%0\n"
-                             "    SSM   %1" 
-			     : : "m" (pgdir_k), "m" (ssm_mask));
-
-        local_flush_tlb();
-
-	{
-		unsigned long zones_size[MAX_NR_ZONES];
-
-		memset(zones_size, 0, sizeof(zones_size));
-		zones_size[ZONE_DMA] = max_low_pfn;
-		free_area_init_node(0, &contig_page_data, zones_size,
-				    __pa(PAGE_OFFSET) >> PAGE_SHIFT,
-				    zholes_size);
-	}
-        return;
+	vmem_map_init();
+	sparse_init();
+	zone_dma_bits = 31;
+	memset(max_zone_pfns, 0, sizeof(max_zone_pfns));
+	max_zone_pfns[ZONE_DMA] = virt_to_pfn(MAX_DMA_ADDRESS);
+	max_zone_pfns[ZONE_NORMAL] = max_low_pfn;
+	free_area_init(max_zone_pfns);
 }
 
-#else /* CONFIG_ARCH_S390X */
-void __init paging_init(void)
+void mark_rodata_ro(void)
 {
-        pgd_t * pg_dir;
-	pmd_t * pm_dir;
-        pte_t * pt_dir;
-        pte_t   pte;
-	int     i,j,k;
-        unsigned long pfn = 0;
-        unsigned long pgdir_k = (__pa(swapper_pg_dir) & PAGE_MASK) |
-          _KERN_REGION_TABLE;
-	static const int ssm_mask = 0x04000000L;
+	unsigned long size = __end_ro_after_init - __start_ro_after_init;
 
-	unsigned long zones_size[MAX_NR_ZONES];
-	unsigned long dma_pfn, high_pfn;
-
-	memset(zones_size, 0, sizeof(zones_size));
-	dma_pfn = MAX_DMA_ADDRESS >> PAGE_SHIFT;
-	high_pfn = max_low_pfn;
-
-	if (dma_pfn > high_pfn)
-		zones_size[ZONE_DMA] = high_pfn;
-	else {
-		zones_size[ZONE_DMA] = dma_pfn;
-		zones_size[ZONE_NORMAL] = high_pfn - dma_pfn;
-	}
-
-	/* Initialize mem_map[].  */
-	free_area_init_node(0, &contig_page_data, zones_size,
-			    __pa(PAGE_OFFSET) >> PAGE_SHIFT, zholes_size);
-
-	/*
-	 * map whole physical memory to virtual memory (identity mapping) 
-	 */
-
-        pg_dir = swapper_pg_dir;
-	
-        for (i = 0 ; i < PTRS_PER_PGD ; i++,pg_dir++) {
-	
-                if (pfn >= max_low_pfn) {
-                        pgd_clear(pg_dir);
-                        continue;
-                }          
-        
-	        pm_dir = (pmd_t *) alloc_bootmem_low_pages(PAGE_SIZE*4);
-                pgd_populate(&init_mm, pg_dir, pm_dir);
-
-                for (j = 0 ; j < PTRS_PER_PMD ; j++,pm_dir++) {
-                        if (pfn >= max_low_pfn) {
-                                pmd_clear(pm_dir);
-                                continue; 
-                        }          
-                        
-                        pt_dir = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
-                        pmd_populate_kernel(&init_mm, pm_dir, pt_dir);
-	
-                        for (k = 0 ; k < PTRS_PER_PTE ; k++,pt_dir++) {
-                                pte = pfn_pte(pfn, PAGE_KERNEL);
-                                if (pfn >= max_low_pfn) {
-                                        pte_clear(&init_mm, 0, &pte); 
-                                        continue;
-                                }
-                                set_pte(pt_dir, pte);
-                                pfn++;
-                        }
-                }
-        }
-
-	S390_lowcore.kernel_asce = pgdir_k;
-
-        /* enable virtual mapping in kernel mode */
-        __asm__ __volatile__("lctlg 1,1,%0\n\t"
-                             "lctlg 7,7,%0\n\t"
-                             "lctlg 13,13,%0\n\t"
-                             "ssm   %1"
-			     : :"m" (pgdir_k), "m" (ssm_mask));
-
-        local_flush_tlb();
-
-        return;
+	__set_memory_ro(__start_ro_after_init, __end_ro_after_init);
+	pr_info("Write protected read-only-after-init data: %luk\n", size >> 10);
 }
-#endif /* CONFIG_ARCH_S390X */
+
+int set_memory_encrypted(unsigned long vaddr, int numpages)
+{
+	int i;
+
+	/* make specified pages unshared, (swiotlb, dma_free) */
+	for (i = 0; i < numpages; ++i) {
+		uv_remove_shared(virt_to_phys((void *)vaddr));
+		vaddr += PAGE_SIZE;
+	}
+	return 0;
+}
+
+int set_memory_decrypted(unsigned long vaddr, int numpages)
+{
+	int i;
+	/* make specified pages shared (swiotlb, dma_alloca) */
+	for (i = 0; i < numpages; ++i) {
+		uv_set_shared(virt_to_phys((void *)vaddr));
+		vaddr += PAGE_SIZE;
+	}
+	return 0;
+}
+
+/* are we a protected virtualization guest? */
+bool force_dma_unencrypted(struct device *dev)
+{
+	return is_prot_virt_guest();
+}
+
+/* protected virtualization */
+static void pv_init(void)
+{
+	if (!is_prot_virt_guest())
+		return;
+
+	virtio_set_mem_acc_cb(virtio_require_restricted_mem_acc);
+
+	/* make sure bounce buffers are shared */
+	swiotlb_init(true, SWIOTLB_FORCE | SWIOTLB_VERBOSE);
+	swiotlb_update_mem_attributes();
+}
 
 void __init mem_init(void)
 {
-	unsigned long codesize, reservedpages, datasize, initsize;
+	cpumask_set_cpu(0, &init_mm.context.cpu_attach_mask);
+	cpumask_set_cpu(0, mm_cpumask(&init_mm));
 
-        max_mapnr = num_physpages = max_low_pfn;
+	set_max_mapnr(max_low_pfn);
         high_memory = (void *) __va(max_low_pfn * PAGE_SIZE);
 
-        /* clear the zero-page */
-        memset(empty_zero_page, 0, PAGE_SIZE);
+	pv_init();
+	kfence_split_mapping();
 
 	/* this will put all low memory onto the freelists */
-	totalram_pages += free_all_bootmem();
-
-	reservedpages = 0;
-
-	codesize =  (unsigned long) &_etext - (unsigned long) &_text;
-	datasize =  (unsigned long) &_edata - (unsigned long) &_etext;
-	initsize =  (unsigned long) &__init_end - (unsigned long) &__init_begin;
-        printk("Memory: %luk/%luk available (%ldk kernel code, %ldk reserved, %ldk data, %ldk init)\n",
-                (unsigned long) nr_free_pages() << (PAGE_SHIFT-10),
-                max_mapnr << (PAGE_SHIFT-10),
-                codesize >> 10,
-                reservedpages << (PAGE_SHIFT-10),
-                datasize >>10,
-                initsize >> 10);
+	memblock_free_all();
+	setup_zero_pages();	/* Setup zeroed pages. */
 }
 
 void free_initmem(void)
 {
-        unsigned long addr;
-
-        addr = (unsigned long)(&__init_begin);
-        for (; addr < (unsigned long)(&__init_end); addr += PAGE_SIZE) {
-		ClearPageReserved(virt_to_page(addr));
-		set_page_count(virt_to_page(addr), 1);
-		free_page(addr);
-		totalram_pages++;
-        }
-        printk ("Freeing unused kernel memory: %ldk freed\n",
-		((unsigned long)&__init_end - (unsigned long)&__init_begin) >> 10);
+	set_memory_rwnx((unsigned long)_sinittext,
+			(unsigned long)(_einittext - _sinittext) >> PAGE_SHIFT);
+	free_initmem_default(POISON_FREE_INITMEM);
 }
 
-#ifdef CONFIG_BLK_DEV_INITRD
-void free_initrd_mem(unsigned long start, unsigned long end)
+unsigned long memory_block_size_bytes(void)
 {
-        if (start < end)
-                printk ("Freeing initrd memory: %ldk freed\n", (end - start) >> 10);
-        for (; start < end; start += PAGE_SIZE) {
-                ClearPageReserved(virt_to_page(start));
-                set_page_count(virt_to_page(start), 1);
-                free_page(start);
-                totalram_pages++;
-        }
+	/*
+	 * Make sure the memory block size is always greater
+	 * or equal than the memory increment size.
+	 */
+	return max_t(unsigned long, MIN_MEMORY_BLOCK_SIZE, sclp.rzm);
 }
-#endif
+
+unsigned long __per_cpu_offset[NR_CPUS] __read_mostly;
+EXPORT_SYMBOL(__per_cpu_offset);
+
+static int __init pcpu_cpu_distance(unsigned int from, unsigned int to)
+{
+	return LOCAL_DISTANCE;
+}
+
+static int __init pcpu_cpu_to_node(int cpu)
+{
+	return 0;
+}
+
+void __init setup_per_cpu_areas(void)
+{
+	unsigned long delta;
+	unsigned int cpu;
+	int rc;
+
+	/*
+	 * Always reserve area for module percpu variables.  That's
+	 * what the legacy allocator did.
+	 */
+	rc = pcpu_embed_first_chunk(PERCPU_MODULE_RESERVE,
+				    PERCPU_DYNAMIC_RESERVE, PAGE_SIZE,
+				    pcpu_cpu_distance,
+				    pcpu_cpu_to_node);
+	if (rc < 0)
+		panic("Failed to initialize percpu areas.");
+
+	delta = (unsigned long)pcpu_base_addr - (unsigned long)__per_cpu_start;
+	for_each_possible_cpu(cpu)
+		__per_cpu_offset[cpu] = delta + pcpu_unit_offsets[cpu];
+}
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+
+#ifdef CONFIG_CMA
+
+/* Prevent memory blocks which contain cma regions from going offline */
+
+struct s390_cma_mem_data {
+	unsigned long start;
+	unsigned long end;
+};
+
+static int s390_cma_check_range(struct cma *cma, void *data)
+{
+	struct s390_cma_mem_data *mem_data;
+	unsigned long start, end;
+
+	mem_data = data;
+	start = cma_get_base(cma);
+	end = start + cma_get_size(cma);
+	if (end < mem_data->start)
+		return 0;
+	if (start >= mem_data->end)
+		return 0;
+	return -EBUSY;
+}
+
+static int s390_cma_mem_notifier(struct notifier_block *nb,
+				 unsigned long action, void *data)
+{
+	struct s390_cma_mem_data mem_data;
+	struct memory_notify *arg;
+	int rc = 0;
+
+	arg = data;
+	mem_data.start = arg->start_pfn << PAGE_SHIFT;
+	mem_data.end = mem_data.start + (arg->nr_pages << PAGE_SHIFT);
+	if (action == MEM_GOING_OFFLINE)
+		rc = cma_for_each_area(s390_cma_check_range, &mem_data);
+	return notifier_from_errno(rc);
+}
+
+static struct notifier_block s390_cma_mem_nb = {
+	.notifier_call = s390_cma_mem_notifier,
+};
+
+static int __init s390_cma_mem_init(void)
+{
+	return register_memory_notifier(&s390_cma_mem_nb);
+}
+device_initcall(s390_cma_mem_init);
+
+#endif /* CONFIG_CMA */
+
+int arch_add_memory(int nid, u64 start, u64 size,
+		    struct mhp_params *params)
+{
+	unsigned long start_pfn = PFN_DOWN(start);
+	unsigned long size_pages = PFN_DOWN(size);
+	int rc;
+
+	if (WARN_ON_ONCE(params->pgprot.pgprot != PAGE_KERNEL.pgprot))
+		return -EINVAL;
+
+	VM_BUG_ON(!mhp_range_allowed(start, size, true));
+	rc = vmem_add_mapping(start, size);
+	if (rc)
+		return rc;
+
+	rc = __add_pages(nid, start_pfn, size_pages, params);
+	if (rc)
+		vmem_remove_mapping(start, size);
+	return rc;
+}
+
+void arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
+{
+	unsigned long start_pfn = start >> PAGE_SHIFT;
+	unsigned long nr_pages = size >> PAGE_SHIFT;
+
+	__remove_pages(start_pfn, nr_pages, altmap);
+	vmem_remove_mapping(start, size);
+}
+#endif /* CONFIG_MEMORY_HOTPLUG */
+
+#ifdef CONFIG_EXECMEM
+static struct execmem_info execmem_info __ro_after_init;
+
+struct execmem_info __init *execmem_arch_setup(void)
+{
+	unsigned long module_load_offset = 0;
+	unsigned long start;
+
+	if (kaslr_enabled())
+		module_load_offset = get_random_u32_inclusive(1, 1024) * PAGE_SIZE;
+
+	start = MODULES_VADDR + module_load_offset;
+
+	execmem_info = (struct execmem_info){
+		.ranges = {
+			[EXECMEM_DEFAULT] = {
+				.flags	= EXECMEM_KASAN_SHADOW,
+				.start	= start,
+				.end	= MODULES_END,
+				.pgprot	= PAGE_KERNEL,
+				.alignment = MODULE_ALIGN,
+			},
+		},
+	};
+
+	return &execmem_info;
+}
+#endif /* CONFIG_EXECMEM */

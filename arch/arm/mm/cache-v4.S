@@ -1,17 +1,24 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/mm/cache-v4.S
  *
  *  Copyright (C) 1997-2002 Russell king
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 #include <linux/linkage.h>
 #include <linux/init.h>
-#include <asm/hardware.h>
+#include <linux/cfi_types.h>
+#include <asm/assembler.h>
 #include <asm/page.h>
 #include "proc-macros.S"
+
+/*
+ *	flush_icache_all()
+ *
+ *	Unconditionally clean and invalidate the entire icache.
+ */
+SYM_TYPED_FUNC_START(v4_flush_icache_all)
+	ret	lr
+SYM_FUNC_END(v4_flush_icache_all)
 
 /*
  *	flush_user_cache_all()
@@ -21,17 +28,22 @@
  *
  *	- mm	- mm_struct describing address space
  */
-ENTRY(v4_flush_user_cache_all)
-	/* FALLTHROUGH */
+SYM_FUNC_ALIAS(v4_flush_user_cache_all, v4_flush_kern_cache_all)
+
 /*
  *	flush_kern_cache_all()
  *
  *	Clean and invalidate the entire cache.
  */
-ENTRY(v4_flush_kern_cache_all)
+SYM_TYPED_FUNC_START(v4_flush_kern_cache_all)
+#ifdef CONFIG_CPU_CP15
 	mov	r0, #0
 	mcr	p15, 0, r0, c7, c7, 0		@ flush ID cache
-	mov	pc, lr
+	ret	lr
+#else
+	ret	lr
+#endif
+SYM_FUNC_END(v4_flush_kern_cache_all)
 
 /*
  *	flush_user_cache_range(start, end, flags)
@@ -43,10 +55,15 @@ ENTRY(v4_flush_kern_cache_all)
  *	- end	- end address (exclusive, may not be aligned)
  *	- flags	- vma_area_struct flags describing address space
  */
-ENTRY(v4_flush_user_cache_range)
+SYM_TYPED_FUNC_START(v4_flush_user_cache_range)
+#ifdef CONFIG_CPU_CP15
 	mov	ip, #0
-	mcreq	p15, 0, ip, c7, c7, 0		@ flush ID cache
-	mov	pc, lr
+	mcr	p15, 0, ip, c7, c7, 0		@ flush ID cache
+	ret	lr
+#else
+	ret	lr
+#endif
+SYM_FUNC_END(v4_flush_user_cache_range)
 
 /*
  *	coherent_kern_range(start, end)
@@ -58,8 +75,9 @@ ENTRY(v4_flush_user_cache_range)
  *	- start  - virtual start address
  *	- end	 - virtual end address
  */
-ENTRY(v4_coherent_kern_range)
-	/* FALLTHROUGH */
+SYM_TYPED_FUNC_START(v4_coherent_kern_range)
+	ret	lr
+SYM_FUNC_END(v4_coherent_kern_range)
 
 /*
  *	coherent_user_range(start, end)
@@ -71,33 +89,25 @@ ENTRY(v4_coherent_kern_range)
  *	- start  - virtual start address
  *	- end	 - virtual end address
  */
-ENTRY(v4_coherent_user_range)
-	mov	pc, lr
+SYM_TYPED_FUNC_START(v4_coherent_user_range)
+	mov	r0, #0
+	ret	lr
+SYM_FUNC_END(v4_coherent_user_range)
 
 /*
- *	flush_kern_dcache_page(void *page)
+ *	flush_kern_dcache_area(void *addr, size_t size)
  *
  *	Ensure no D cache aliasing occurs, either with itself or
  *	the I cache
  *
- *	- addr	- page aligned address
+ *	- addr	- kernel address
+ *	- size	- region size
  */
-ENTRY(v4_flush_kern_dcache_page)
-	/* FALLTHROUGH */
-
-/*
- *	dma_inv_range(start, end)
- *
- *	Invalidate (discard) the specified virtual address range.
- *	May not write back any entries.  If 'start' or 'end'
- *	are not cache line aligned, those lines must be written
- *	back.
- *
- *	- start  - virtual start address
- *	- end	 - virtual end address
- */
-ENTRY(v4_dma_inv_range)
-	/* FALLTHROUGH */
+SYM_TYPED_FUNC_START(v4_flush_kern_dcache_area)
+#ifdef CONFIG_CFI_CLANG /* Fallthrough if !CFI */
+	b	v4_dma_flush_range
+#endif
+SYM_FUNC_END(v4_flush_kern_dcache_area)
 
 /*
  *	dma_flush_range(start, end)
@@ -107,33 +117,32 @@ ENTRY(v4_dma_inv_range)
  *	- start  - virtual start address
  *	- end	 - virtual end address
  */
-ENTRY(v4_dma_flush_range)
+SYM_TYPED_FUNC_START(v4_dma_flush_range)
+#ifdef CONFIG_CPU_CP15
 	mov	r0, #0
 	mcr	p15, 0, r0, c7, c7, 0		@ flush ID cache
-	/* FALLTHROUGH */
+#endif
+	ret	lr
+SYM_FUNC_END(v4_dma_flush_range)
 
 /*
- *	dma_clean_range(start, end)
- *
- *	Clean (write back) the specified virtual address range.
- *
- *	- start  - virtual start address
- *	- end	 - virtual end address
+ *	dma_unmap_area(start, size, dir)
+ *	- start	- kernel virtual start address
+ *	- size	- size of region
+ *	- dir	- DMA direction
  */
-ENTRY(v4_dma_clean_range)
-	mov	pc, lr
+SYM_TYPED_FUNC_START(v4_dma_unmap_area)
+	teq	r2, #DMA_TO_DEVICE
+	bne	v4_dma_flush_range
+	ret	lr
+SYM_FUNC_END(v4_dma_unmap_area)
 
-	__INITDATA
-
-	.type	v4_cache_fns, #object
-ENTRY(v4_cache_fns)
-	.long	v4_flush_kern_cache_all
-	.long	v4_flush_user_cache_all
-	.long	v4_flush_user_cache_range
-	.long	v4_coherent_kern_range
-	.long	v4_coherent_user_range
-	.long	v4_flush_kern_dcache_page
-	.long	v4_dma_inv_range
-	.long	v4_dma_clean_range
-	.long	v4_dma_flush_range
-	.size	v4_cache_fns, . - v4_cache_fns
+/*
+ *	dma_map_area(start, size, dir)
+ *	- start	- kernel virtual start address
+ *	- size	- size of region
+ *	- dir	- DMA direction
+ */
+SYM_TYPED_FUNC_START(v4_dma_map_area)
+	ret	lr
+SYM_FUNC_END(v4_dma_map_area)

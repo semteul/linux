@@ -1,8 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 
 /*  Driver for the Iomega MatchMaker parallel port SCSI HBA embedded in 
  * the Iomega ZIP Plus drive
  * 
- * (c) 1998     David Campbell     campbell@torque.net
+ * (c) 1998     David Campbell
  *
  * Please note that I live in Perth, Western Australia. GMT+0800
  */
@@ -66,7 +67,6 @@
  */
 /* ------ END OF USER CONFIGURABLE PARAMETERS ----- */
 
-#include  <linux/config.h>
 #include  <linux/stddef.h>
 #include  <linux/module.h>
 #include  <linux/kernel.h>
@@ -100,11 +100,7 @@ static char *IMM_MODE_STRING[] =
 	[IMM_PS2]	 = "PS/2",
 	[IMM_EPP_8]	 = "EPP 8 bit",
 	[IMM_EPP_16]	 = "EPP 16 bit",
-#ifdef CONFIG_SCSI_IZIP_EPP16
-	[IMM_EPP_32]	 = "EPP 16 bit",
-#else
 	[IMM_EPP_32]	 = "EPP 32 bit",
-#endif
 	[IMM_UNKNOWN]	 = "Unknown",
 };
 
@@ -138,6 +134,11 @@ static char *IMM_MODE_STRING[] =
 #else
 #define w_ctr(x,y)      outb(y, (x)+2)
 #endif
+
+static inline struct scsi_pointer *imm_scsi_pointer(struct scsi_cmnd *cmd)
+{
+	return scsi_cmd_priv(cmd);
+}
 
 static int imm_engine(imm_struct *, struct scsi_cmnd *);
 

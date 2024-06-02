@@ -1,22 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  NRPN / SYSEX callbacks for Emu8k/Emu10k1
  *
  *  Copyright (c) 1999-2000 Takashi Iwai <tiwai@suse.de>
- *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
  */
 
 #include "emux_voice.h"
@@ -27,11 +13,11 @@
  */
 
 /* NRPN / CC -> Emu8000 parameter converter */
-typedef struct {
+struct nrpn_conv_table {
 	int control;
 	int effect;
 	int (*convert)(int val);
-} nrpn_conv_table;
+};
 
 /* effect sensitivity */
 
@@ -48,8 +34,10 @@ typedef struct {
  * convert NRPN/control values
  */
 
-static int send_converted_effect(nrpn_conv_table *table, int num_tables,
-				 snd_emux_port_t *port, snd_midi_channel_t *chan,
+static int send_converted_effect(const struct nrpn_conv_table *table,
+				 int num_tables,
+				 struct snd_emux_port *port,
+				 struct snd_midi_channel *chan,
 				 int type, int val, int mode)
 {
 	int i, cval;
@@ -75,16 +63,16 @@ static int send_converted_effect(nrpn_conv_table *table, int num_tables,
 /* effect sensitivities for GS NRPN:
  *  adjusted for chaos 8MB soundfonts
  */
-static int gs_sense[] = 
+static const int gs_sense[] =
 {
 	DEF_FX_CUTOFF, DEF_FX_RESONANCE, DEF_FX_ATTACK, DEF_FX_RELEASE,
 	DEF_FX_VIBRATE, DEF_FX_VIBDEPTH, DEF_FX_VIBDELAY
 };
 
-/* effect sensitivies for XG controls:
+/* effect sensitivities for XG controls:
  * adjusted for chaos 8MB soundfonts
  */
-static int xg_sense[] = 
+static const int xg_sense[] =
 {
 	DEF_FX_CUTOFF, DEF_FX_RESONANCE, DEF_FX_ATTACK, DEF_FX_RELEASE,
 	DEF_FX_VIBRATE, DEF_FX_VIBDEPTH, DEF_FX_VIBDELAY
@@ -178,7 +166,7 @@ static int fx_conv_Q(int val)
 }
 
 
-static nrpn_conv_table awe_effects[] =
+static const struct nrpn_conv_table awe_effects[] =
 {
 	{ 0, EMUX_FX_LFO1_DELAY,	fx_lfo1_delay},
 	{ 1, EMUX_FX_LFO1_FREQ,	fx_lfo1_freq},
@@ -265,7 +253,7 @@ static int gs_vib_delay(int val)
 	return -(val - 64) * gs_sense[FX_VIBDELAY] / 50;
 }
 
-static nrpn_conv_table gs_effects[] =
+static const struct nrpn_conv_table gs_effects[] =
 {
 	{32, EMUX_FX_CUTOFF,	gs_cutoff},
 	{33, EMUX_FX_FILTERQ,	gs_filterQ},
@@ -282,13 +270,14 @@ static nrpn_conv_table gs_effects[] =
  * NRPN events
  */
 void
-snd_emux_nrpn(void *p, snd_midi_channel_t *chan, snd_midi_channel_set_t *chset)
+snd_emux_nrpn(void *p, struct snd_midi_channel *chan,
+	      struct snd_midi_channel_set *chset)
 {
-	snd_emux_port_t *port;
+	struct snd_emux_port *port;
 
 	port = p;
-	snd_assert(port != NULL, return);
-	snd_assert(chan != NULL, return);
+	if (snd_BUG_ON(!port || !chan))
+		return;
 
 	if (chan->control[MIDI_CTL_NONREG_PARM_NUM_MSB] == 127 &&
 	    chan->control[MIDI_CTL_NONREG_PARM_NUM_LSB] <= 26) {
@@ -348,7 +337,7 @@ static int xg_release(int val)
 	return -(val - 64) * xg_sense[FX_RELEASE] / 64;
 }
 
-static nrpn_conv_table xg_effects[] =
+static const struct nrpn_conv_table xg_effects[] =
 {
 	{71, EMUX_FX_CUTOFF,	xg_cutoff},
 	{74, EMUX_FX_FILTERQ,	xg_filterQ},
@@ -357,8 +346,12 @@ static nrpn_conv_table xg_effects[] =
 };
 
 int
-snd_emux_xg_control(snd_emux_port_t *port, snd_midi_channel_t *chan, int param)
+snd_emux_xg_control(struct snd_emux_port *port, struct snd_midi_channel *chan,
+		    int param)
 {
+	if (param >= ARRAY_SIZE(chan->control))
+		return -EINVAL;
+
 	return send_converted_effect(xg_effects, ARRAY_SIZE(xg_effects),
 				     port, chan, param,
 				     chan->control[param],
@@ -369,14 +362,15 @@ snd_emux_xg_control(snd_emux_port_t *port, snd_midi_channel_t *chan, int param)
  * receive sysex
  */
 void
-snd_emux_sysex(void *p, unsigned char *buf, int len, int parsed, snd_midi_channel_set_t *chset)
+snd_emux_sysex(void *p, unsigned char *buf, int len, int parsed,
+	       struct snd_midi_channel_set *chset)
 {
-	snd_emux_port_t *port;
-	snd_emux_t *emu;
+	struct snd_emux_port *port;
+	struct snd_emux *emu;
 
 	port = p;
-	snd_assert(port != NULL, return);
-	snd_assert(chset != NULL, return);
+	if (snd_BUG_ON(!port || !chset))
+		return;
 	emu = port->emu;
 
 	switch (parsed) {

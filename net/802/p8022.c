@@ -1,10 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *	NET3:	Support for 802.2 demultiplexing off Ethernet (Token ring
- *		is kept separate see p8022tr.c)
- *		This program is free software; you can redistribute it and/or
- *		modify it under the terms of the GNU General Public License
- *		as published by the Free Software Foundation; either version
- *		2 of the License, or (at your option) any later version.
+ *	NET3:	Support for 802.2 demultiplexing off Ethernet
  *
  *		Demultiplex 802.2 encoded protocols. We match the entry by the
  *		SSAP/DSAP pair and then deliver to the registered datalink that
@@ -18,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <linux/slab.h>
 #include <net/datalink.h>
 #include <linux/mm.h>
 #include <linux/in.h>
@@ -26,7 +23,7 @@
 #include <net/p8022.h>
 
 static int p8022_request(struct datalink_proto *dl, struct sk_buff *skb,
-			 unsigned char *dest)
+			 const unsigned char *dest)
 {
 	llc_build_and_send_ui_pkt(dl->sap, skb, dest, dl->sap->laddr.lsap);
 	return 0;
@@ -35,7 +32,8 @@ static int p8022_request(struct datalink_proto *dl, struct sk_buff *skb,
 struct datalink_proto *register_8022_client(unsigned char type,
 					    int (*func)(struct sk_buff *skb,
 							struct net_device *dev,
-							struct packet_type *pt))
+							struct packet_type *pt,
+							struct net_device *orig_dev))
 {
 	struct datalink_proto *proto;
 
@@ -55,11 +53,12 @@ struct datalink_proto *register_8022_client(unsigned char type,
 
 void unregister_8022_client(struct datalink_proto *proto)
 {
-	llc_sap_close(proto->sap);
+	llc_sap_put(proto->sap);
 	kfree(proto);
 }
 
 EXPORT_SYMBOL(register_8022_client);
 EXPORT_SYMBOL(unregister_8022_client);
 
+MODULE_DESCRIPTION("Support for 802.2 demultiplexing off Ethernet");
 MODULE_LICENSE("GPL");

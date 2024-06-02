@@ -1,35 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Driver for Digigram VXpocket soundcards
  *
  * lowlevel routines for VXpocket soundcards
  *
  * Copyright (c) 2002 by Takashi Iwai <tiwai@suse.de>
- *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
-#include <sound/driver.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/firmware.h>
+#include <linux/io.h>
 #include <sound/core.h>
-#include <asm/io.h>
 #include "vxpocket.h"
 
 
-static int vxp_reg_offset[VX_REG_MAX] = {
+static const int vxp_reg_offset[VX_REG_MAX] = {
 	[VX_ICR]	= 0x00,		// ICR
 	[VX_CVR]	= 0x01,		// CVR
 	[VX_ISR]	= 0x02,		// ISR
@@ -49,9 +35,9 @@ static int vxp_reg_offset[VX_REG_MAX] = {
 };
 
 
-inline static unsigned long vxp_reg_addr(vx_core_t *_chip, int reg)
+static inline unsigned long vxp_reg_addr(struct vx_core *_chip, int reg)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 	return chip->port + vxp_reg_offset[reg];
 }
 
@@ -59,7 +45,7 @@ inline static unsigned long vxp_reg_addr(vx_core_t *_chip, int reg)
  * snd_vx_inb - read a byte from the register
  * @offset: register offset
  */
-static unsigned char vxp_inb(vx_core_t *chip, int offset)
+static unsigned char vxp_inb(struct vx_core *chip, int offset)
 {
 	return inb(vxp_reg_addr(chip, offset));
 }
@@ -69,7 +55,7 @@ static unsigned char vxp_inb(vx_core_t *chip, int offset)
  * @offset: the register offset
  * @val: the value to write
  */
-static void vxp_outb(vx_core_t *chip, int offset, unsigned char val)
+static void vxp_outb(struct vx_core *chip, int offset, unsigned char val)
 {
 	outb(val, vxp_reg_addr(chip, offset));
 }
@@ -78,9 +64,9 @@ static void vxp_outb(vx_core_t *chip, int offset, unsigned char val)
  * redefine macros to call directly
  */
 #undef vx_inb
-#define vx_inb(chip,reg)	vxp_inb((vx_core_t*)(chip), VX_##reg)
+#define vx_inb(chip,reg)	vxp_inb((struct vx_core *)(chip), VX_##reg)
 #undef vx_outb
-#define vx_outb(chip,reg,val)	vxp_outb((vx_core_t*)(chip), VX_##reg,val)
+#define vx_outb(chip,reg,val)	vxp_outb((struct vx_core *)(chip), VX_##reg,val)
 
 
 /*
@@ -88,7 +74,7 @@ static void vxp_outb(vx_core_t *chip, int offset, unsigned char val)
  *
  * returns zero if a magic word is detected, or a negative error code.
  */
-static int vx_check_magic(vx_core_t *chip)
+static int vx_check_magic(struct vx_core *chip)
 {
 	unsigned long end_time = jiffies + HZ / 5;
 	int c;
@@ -96,7 +82,7 @@ static int vx_check_magic(vx_core_t *chip)
 		c = vx_inb(chip, CDSP);
 		if (c == CDSP_MAGIC)
 			return 0;
-		snd_vx_delay(chip, 10);
+		msleep(10);
 	} while (time_after_eq(end_time, jiffies));
 	snd_printk(KERN_ERR "cannot find xilinx magic word (%x)\n", c);
 	return -EIO;
@@ -109,9 +95,9 @@ static int vx_check_magic(vx_core_t *chip)
 
 #define XX_DSP_RESET_WAIT_TIME		2	/* ms */
 
-static void vxp_reset_dsp(vx_core_t *_chip)
+static void vxp_reset_dsp(struct vx_core *_chip)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	/* set the reset dsp bit to 1 */
 	vx_outb(chip, CDSP, chip->regCDSP | VXP_CDSP_DSP_RESET_MASK);
@@ -127,32 +113,32 @@ static void vxp_reset_dsp(vx_core_t *_chip)
 /*
  * reset codec bit
  */
-static void vxp_reset_codec(vx_core_t *_chip)
+static void vxp_reset_codec(struct vx_core *_chip)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	/* Set the reset CODEC bit to 1. */
 	vx_outb(chip, CDSP, chip->regCDSP | VXP_CDSP_CODEC_RESET_MASK);
 	vx_inb(chip, CDSP);
-	snd_vx_delay(_chip, 10);
+	msleep(10);
 	/* Set the reset CODEC bit to 0. */
 	chip->regCDSP &= ~VXP_CDSP_CODEC_RESET_MASK;
 	vx_outb(chip, CDSP, chip->regCDSP);
 	vx_inb(chip, CDSP);
-	snd_vx_delay(_chip, 1);
+	msleep(1);
 }
 
 /*
  * vx_load_xilinx_binary - load the xilinx binary image
  * the binary image is the binary array converted from the bitstream file.
  */
-static int vxp_load_xilinx_binary(vx_core_t *_chip, const struct firmware *fw)
+static int vxp_load_xilinx_binary(struct vx_core *_chip, const struct firmware *fw)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 	unsigned int i;
 	int c;
 	int regCSUER, regRUER;
-	unsigned char *image;
+	const unsigned char *image;
 	unsigned char data;
 
 	/* Switch to programmation mode */
@@ -202,12 +188,12 @@ static int vxp_load_xilinx_binary(vx_core_t *_chip, const struct firmware *fw)
 	c |= (int)vx_inb(chip, RXM) << 8;
 	c |= vx_inb(chip, RXL);
 
-	snd_printdd(KERN_DEBUG "xilinx: dsp size received 0x%x, orig 0x%x\n", c, fw->size);
+	snd_printdd(KERN_DEBUG "xilinx: dsp size received 0x%x, orig 0x%zx\n", c, fw->size);
 
 	vx_outb(chip, ICR, ICR_HF0);
 
 	/* TEMPO 250ms : wait until Xilinx is downloaded */
-	snd_vx_delay(_chip, 300);
+	msleep(300);
 
 	/* test magical word */
 	if (vx_check_magic(_chip) < 0)
@@ -221,7 +207,7 @@ static int vxp_load_xilinx_binary(vx_core_t *_chip, const struct firmware *fw)
 	chip->regDIALOG |= VXP_DLG_XILINX_REPROG_MASK;
 	vx_outb(chip, DIALOG, chip->regDIALOG);
 	vx_inb(chip, DIALOG);
-	snd_vx_delay(_chip, 10);
+	msleep(10);
 	chip->regDIALOG &= ~VXP_DLG_XILINX_REPROG_MASK;
 	vx_outb(chip, DIALOG, chip->regDIALOG);
 	vx_inb(chip, DIALOG);
@@ -244,16 +230,18 @@ static int vxp_load_xilinx_binary(vx_core_t *_chip, const struct firmware *fw)
 /*
  * vxp_load_dsp - load_dsp callback
  */
-static int vxp_load_dsp(vx_core_t *vx, int index, const struct firmware *fw)
+static int vxp_load_dsp(struct vx_core *vx, int index, const struct firmware *fw)
 {
 	int err;
 
 	switch (index) {
 	case 0:
 		/* xilinx boot */
-		if ((err = vx_check_magic(vx)) < 0)
+		err = vx_check_magic(vx);
+		if (err < 0)
 			return err;
-		if ((err = snd_vx_load_boot_image(vx, fw)) < 0)
+		err = snd_vx_load_boot_image(vx, fw);
+		if (err < 0)
 			return err;
 		return 0;
 	case 1:
@@ -279,9 +267,9 @@ static int vxp_load_dsp(vx_core_t *vx, int index, const struct firmware *fw)
  *
  * spinlock held!
  */
-static int vxp_test_and_ack(vx_core_t *_chip)
+static int vxp_test_and_ack(struct vx_core *_chip)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	/* not booted yet? */
 	if (! (_chip->chip_status & VX_STAT_XILINX_LOADED))
@@ -306,9 +294,9 @@ static int vxp_test_and_ack(vx_core_t *_chip)
 /*
  * vx_validate_irq - enable/disable IRQ
  */
-static void vxp_validate_irq(vx_core_t *_chip, int enable)
+static void vxp_validate_irq(struct vx_core *_chip, int enable)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	/* Set the interrupt enable bit to 1 in CDSP register */
 	if (enable)
@@ -322,9 +310,9 @@ static void vxp_validate_irq(vx_core_t *_chip, int enable)
  * vx_setup_pseudo_dma - set up the pseudo dma read/write mode.
  * @do_write: 0 = read, 1 = set up for DMA write
  */
-static void vx_setup_pseudo_dma(vx_core_t *_chip, int do_write)
+static void vx_setup_pseudo_dma(struct vx_core *_chip, int do_write)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	/* Interrupt mode and HREQ pin enabled for host transmit / receive data transfers */
 	vx_outb(chip, ICR, do_write ? ICR_TREQ : ICR_RREQ);
@@ -342,9 +330,9 @@ static void vx_setup_pseudo_dma(vx_core_t *_chip, int do_write)
 /*
  * vx_release_pseudo_dma - disable the pseudo-DMA mode
  */
-static void vx_release_pseudo_dma(vx_core_t *_chip)
+static void vx_release_pseudo_dma(struct vx_core *_chip)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	/* Disable DMA and 16-bit accesses */
 	chip->regDIALOG &= ~(VXP_DLG_DMAWRITE_SEL_MASK|
@@ -362,21 +350,21 @@ static void vx_release_pseudo_dma(vx_core_t *_chip)
  * data size must be aligned to 6 bytes to ensure the 24bit alignment on DSP.
  * NB: call with a certain lock!
  */
-static void vxp_dma_write(vx_core_t *chip, snd_pcm_runtime_t *runtime,
-			  vx_pipe_t *pipe, int count)
+static void vxp_dma_write(struct vx_core *chip, struct snd_pcm_runtime *runtime,
+			  struct vx_pipe *pipe, int count)
 {
 	long port = vxp_reg_addr(chip, VX_DMA);
 	int offset = pipe->hw_ptr;
 	unsigned short *addr = (unsigned short *)(runtime->dma_area + offset);
 
 	vx_setup_pseudo_dma(chip, 1);
-	if (offset + count > pipe->buffer_bytes) {
+	if (offset + count >= pipe->buffer_bytes) {
 		int length = pipe->buffer_bytes - offset;
 		count -= length;
 		length >>= 1; /* in 16bit words */
 		/* Transfer using pseudo-dma. */
-		while (length-- > 0) {
-			outw(cpu_to_le16(*addr), port);
+		for (; length > 0; length--) {
+			outw(*addr, port);
 			addr++;
 		}
 		addr = (unsigned short *)runtime->dma_area;
@@ -385,8 +373,8 @@ static void vxp_dma_write(vx_core_t *chip, snd_pcm_runtime_t *runtime,
 	pipe->hw_ptr += count;
 	count >>= 1; /* in 16bit words */
 	/* Transfer using pseudo-dma. */
-	while (count-- > 0) {
-		outw(cpu_to_le16(*addr), port);
+	for (; count > 0; count--) {
+		outw(*addr, port);
 		addr++;
 	}
 	vx_release_pseudo_dma(chip);
@@ -401,36 +389,37 @@ static void vxp_dma_write(vx_core_t *chip, snd_pcm_runtime_t *runtime,
  * the read length must be aligned to 6 bytes, as well as write.
  * NB: call with a certain lock!
  */
-static void vxp_dma_read(vx_core_t *chip, snd_pcm_runtime_t *runtime,
-			 vx_pipe_t *pipe, int count)
+static void vxp_dma_read(struct vx_core *chip, struct snd_pcm_runtime *runtime,
+			 struct vx_pipe *pipe, int count)
 {
-	struct snd_vxpocket *pchip = (struct snd_vxpocket *)chip;
+	struct snd_vxpocket *pchip = to_vxpocket(chip);
 	long port = vxp_reg_addr(chip, VX_DMA);
 	int offset = pipe->hw_ptr;
 	unsigned short *addr = (unsigned short *)(runtime->dma_area + offset);
 
-	snd_assert(count % 2 == 0, return);
+	if (snd_BUG_ON(count % 2))
+		return;
 	vx_setup_pseudo_dma(chip, 0);
-	if (offset + count > pipe->buffer_bytes) {
+	if (offset + count >= pipe->buffer_bytes) {
 		int length = pipe->buffer_bytes - offset;
 		count -= length;
 		length >>= 1; /* in 16bit words */
 		/* Transfer using pseudo-dma. */
-		while (length-- > 0)
-			*addr++ = le16_to_cpu(inw(port));
+		for (; length > 0; length--)
+			*addr++ = inw(port);
 		addr = (unsigned short *)runtime->dma_area;
 		pipe->hw_ptr = 0;
 	}
 	pipe->hw_ptr += count;
 	count >>= 1; /* in 16bit words */
 	/* Transfer using pseudo-dma. */
-	while (count-- > 1)
-		*addr++ = le16_to_cpu(inw(port));
+	for (; count > 1; count--)
+		*addr++ = inw(port);
 	/* Disable DMA */
 	pchip->regDIALOG &= ~VXP_DLG_DMAREAD_SEL_MASK;
 	vx_outb(chip, DIALOG, pchip->regDIALOG);
 	/* Read the last word (16 bits) */
-	*addr = le16_to_cpu(inw(port));
+	*addr = inw(port);
 	/* Disable 16-bit accesses */
 	pchip->regDIALOG &= ~VXP_DLG_DMA16_SEL_MASK;
 	vx_outb(chip, DIALOG, pchip->regDIALOG);
@@ -442,7 +431,7 @@ static void vxp_dma_read(vx_core_t *chip, snd_pcm_runtime_t *runtime,
 /*
  * write a codec data (24bit)
  */
-static void vxp_write_codec_reg(vx_core_t *chip, int codec, unsigned int data)
+static void vxp_write_codec_reg(struct vx_core *chip, int codec, unsigned int data)
 {
 	int i;
 
@@ -465,15 +454,14 @@ static void vxp_write_codec_reg(vx_core_t *chip, int codec, unsigned int data)
  * vx_set_mic_boost - set mic boost level (on vxp440 only)
  * @boost: 0 = 20dB, 1 = +38dB
  */
-void vx_set_mic_boost(vx_core_t *chip, int boost)
+void vx_set_mic_boost(struct vx_core *chip, int boost)
 {
-	struct snd_vxpocket *pchip = (struct snd_vxpocket *)chip;
-	unsigned long flags;
+	struct snd_vxpocket *pchip = to_vxpocket(chip);
 
 	if (chip->chip_status & VX_STAT_IS_STALE)
 		return;
 
-	spin_lock_irqsave(&chip->lock, flags);
+	mutex_lock(&chip->lock);
 	if (pchip->regCDSP & P24_CDSP_MICS_SEL_MASK) {
 		if (boost) {
 			/* boost: 38 dB */
@@ -486,7 +474,7 @@ void vx_set_mic_boost(vx_core_t *chip, int boost)
                 }
 		vx_outb(chip, CDSP, pchip->regCDSP);
 	}
-	spin_unlock_irqrestore(&chip->lock, flags);
+	mutex_unlock(&chip->lock);
 }
 
 /*
@@ -508,29 +496,28 @@ static int vx_compute_mic_level(int level)
  * vx_set_mic_level - set mic level (on vxpocket only)
  * @level: the mic level = 0 - 8 (max)
  */
-void vx_set_mic_level(vx_core_t *chip, int level)
+void vx_set_mic_level(struct vx_core *chip, int level)
 {
-	struct snd_vxpocket *pchip = (struct snd_vxpocket *)chip;
-	unsigned long flags;
+	struct snd_vxpocket *pchip = to_vxpocket(chip);
 
 	if (chip->chip_status & VX_STAT_IS_STALE)
 		return;
 
-	spin_lock_irqsave(&chip->lock, flags);
+	mutex_lock(&chip->lock);
 	if (pchip->regCDSP & VXP_CDSP_MIC_SEL_MASK) {
 		level = vx_compute_mic_level(level);
 		vx_outb(chip, MICRO, level);
 	}
-	spin_unlock_irqrestore(&chip->lock, flags);
+	mutex_unlock(&chip->lock);
 }
 
 
 /*
  * change the input audio source
  */
-static void vxp_change_audio_source(vx_core_t *_chip, int src)
+static void vxp_change_audio_source(struct vx_core *_chip, int src)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	switch (src) {
 	case VX_AUDIO_SRC_DIGITAL:
@@ -568,9 +555,9 @@ static void vxp_change_audio_source(vx_core_t *_chip, int src)
  * change the clock source
  * source = INTERNAL_QUARTZ or UER_SYNC
  */
-static void vxp_set_clock_source(vx_core_t *_chip, int source)
+static void vxp_set_clock_source(struct vx_core *_chip, int source)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	if (source == INTERNAL_QUARTZ)
 		chip->regCDSP &= ~VXP_CDSP_CLOCKIN_SEL_MASK;
@@ -583,9 +570,9 @@ static void vxp_set_clock_source(vx_core_t *_chip, int source)
 /*
  * reset the board
  */
-static void vxp_reset_board(vx_core_t *_chip, int cold_reset)
+static void vxp_reset_board(struct vx_core *_chip, int cold_reset)
 {
-	struct snd_vxpocket *chip = (struct snd_vxpocket *)_chip;
+	struct snd_vxpocket *chip = to_vxpocket(_chip);
 
 	chip->regCDSP = 0;
 	chip->regDIALOG = 0;
@@ -596,7 +583,7 @@ static void vxp_reset_board(vx_core_t *_chip, int cold_reset)
  * callbacks
  */
 /* exported */
-struct snd_vx_ops snd_vxpocket_ops = {
+const struct snd_vx_ops snd_vxpocket_ops = {
 	.in8 = vxp_inb,
 	.out8 = vxp_outb,
 	.test_and_ack = vxp_test_and_ack,

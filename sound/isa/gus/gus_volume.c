@@ -1,25 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
- *
- *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
+ *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
  */
 
-#include <sound/driver.h>
 #include <linux/time.h>
+#include <linux/export.h>
 #include <sound/core.h>
 #include <sound/gus.h>
 #define __GUS_TABLES_ALLOC__
@@ -55,6 +40,8 @@ unsigned short snd_gf1_lvol_to_gvol_raw(unsigned int vol)
 	return (e << 8) | m;
 }
 
+#if 0
+
 unsigned int snd_gf1_gvol_to_lvol_raw(unsigned short gf1_vol)
 {
 	unsigned int rvol;
@@ -70,12 +57,12 @@ unsigned int snd_gf1_gvol_to_lvol_raw(unsigned short gf1_vol)
 	return rvol | (m >> (8 - e));
 }
 
-unsigned int snd_gf1_calc_ramp_rate(snd_gus_card_t * gus,
+unsigned int snd_gf1_calc_ramp_rate(struct snd_gus_card * gus,
 				    unsigned short start,
 				    unsigned short end,
 				    unsigned int us)
 {
-	static unsigned char vol_rates[19] =
+	static const unsigned char vol_rates[19] =
 	{
 		23, 24, 26, 28, 29, 31, 32, 34,
 		36, 37, 39, 40, 42, 44, 45, 47,
@@ -108,21 +95,25 @@ unsigned int snd_gf1_calc_ramp_rate(snd_gus_card_t * gus,
 	return (range << 6) | (increment & 0x3f);
 }
 
-unsigned short snd_gf1_translate_freq(snd_gus_card_t * gus, unsigned int freq16)
+#endif  /*  0  */
+
+unsigned short snd_gf1_translate_freq(struct snd_gus_card * gus, unsigned int freq16)
 {
 	freq16 >>= 3;
 	if (freq16 < 50)
 		freq16 = 50;
 	if (freq16 & 0xf8000000) {
 		freq16 = ~0xf8000000;
-		snd_printk("snd_gf1_translate_freq: overflow - freq = 0x%x\n", freq16);
+		snd_printk(KERN_ERR "snd_gf1_translate_freq: overflow - freq = 0x%x\n", freq16);
 	}
 	return ((freq16 << 9) + (gus->gf1.playback_freq >> 1)) / gus->gf1.playback_freq;
 }
 
+#if 0
+
 short snd_gf1_compute_vibrato(short cents, unsigned short fc_register)
 {
-	static short vibrato_table[] =
+	static const short vibrato_table[] =
 	{
 		0, 0, 32, 592, 61, 1175, 93, 1808,
 		124, 2433, 152, 3007, 182, 3632, 213, 4290,
@@ -130,7 +121,8 @@ short snd_gf1_compute_vibrato(short cents, unsigned short fc_register)
 	};
 
 	long depth;
-	short *vi1, *vi2, pcents, v1;
+	const short *vi1, *vi2;
+	short pcents, v1;
 
 	pcents = cents < 0 ? -cents : cents;
 	for (vi1 = vibrato_table, vi2 = vi1 + 2; pcents > *vi2; vi1 = vi2, vi2 += 2);
@@ -154,7 +146,7 @@ short snd_gf1_compute_vibrato(short cents, unsigned short fc_register)
 
 unsigned short snd_gf1_compute_pitchbend(unsigned short pitchbend, unsigned short sens)
 {
-	static long log_table[] = {1024, 1085, 1149, 1218, 1290, 1367, 1448, 1534, 1625, 1722, 1825, 1933};
+	static const long log_table[] = {1024, 1085, 1149, 1218, 1290, 1367, 1448, 1534, 1625, 1722, 1825, 1933};
 	int wheel, sensitivity;
 	unsigned int mantissa, f1, f2;
 	unsigned short semitones, f1_index, f2_index, f1_power, f2_power;
@@ -197,14 +189,16 @@ unsigned short snd_gf1_compute_freq(unsigned int freq,
 	fc = (freq << 10) / rate;
 	if (fc > 97391L) {
 		fc = 97391;
-		snd_printk("patch: (1) fc frequency overflow - %u\n", fc);
+		snd_printk(KERN_ERR "patch: (1) fc frequency overflow - %u\n", fc);
 	}
 	fc = (fc * 44100UL) / mix_rate;
 	while (scale--)
 		fc <<= 1;
 	if (fc > 65535L) {
 		fc = 65535;
-		snd_printk("patch: (2) fc frequency overflow - %u\n", fc);
+		snd_printk(KERN_ERR "patch: (2) fc frequency overflow - %u\n", fc);
 	}
 	return (unsigned short) fc;
 }
+
+#endif  /*  0  */

@@ -3,7 +3,7 @@
  *					   in Chip RAM with the kernel command
  *					   line option `debug=mem'.
  *
- *  © Copyright 1996 by Geert Uytterhoeven <geert@linux-m68k.org>
+ *  Â© Copyright 1996 by Geert Uytterhoeven <geert@linux-m68k.org>
  *
  *
  *  Usage:
@@ -34,7 +34,7 @@ struct savekmsg {
     u_long magic2;	/* SAVEKMSG_MAGIC2 */
     u_long magicptr;	/* address of magic1 */
     u_long size;
-    char data[0];
+    char data[];
 };
 
 

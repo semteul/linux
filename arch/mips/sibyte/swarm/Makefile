@@ -1,3 +1,5 @@
-lib-y				= setup.o rtc_xicor1241.o rtc_m41t81.o
+# SPDX-License-Identifier: GPL-2.0-only
+obj-y				:= platform.o setup.o rtc_xicor1241.o \
+				   rtc_m41t81.o
 
-lib-$(CONFIG_KGDB)		+= dbg_io.o
+obj-$(CONFIG_I2C_BOARDINFO)	+= swarm-i2c.o

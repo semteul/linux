@@ -1,29 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *   32bit -> 64bit ioctl wrapper for sequencer API
  *   Copyright (c) by Takashi Iwai <tiwai@suse.de>
- *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
  */
 
 /* This file included from seq.c */
 
 #include <linux/compat.h>
+#include <linux/slab.h>
 
-struct sndrv_seq_port_info32 {
-	struct sndrv_seq_addr addr;	/* client/port numbers */
+struct snd_seq_port_info32 {
+	struct snd_seq_addr addr;	/* client/port numbers */
 	char name[64];			/* port name */
 
 	u32 capability;	/* port capability bits */
@@ -41,36 +28,31 @@ struct sndrv_seq_port_info32 {
 	char reserved[59];		/* for future use */
 };
 
-static int snd_seq_call_port_info_ioctl(client_t *client, unsigned int cmd,
-					struct sndrv_seq_port_info32 __user *data32)
+static int snd_seq_call_port_info_ioctl(struct snd_seq_client *client, unsigned int cmd,
+					struct snd_seq_port_info32 __user *data32)
 {
-	int err = -EFAULT;
-	snd_seq_port_info_t *data;
-	mm_segment_t fs;
+	struct snd_seq_port_info *data __free(kfree) = NULL;
+	int err;
 
 	data = kmalloc(sizeof(*data), GFP_KERNEL);
-	if (! data)
+	if (!data)
 		return -ENOMEM;
 
 	if (copy_from_user(data, data32, sizeof(*data32)) ||
 	    get_user(data->flags, &data32->flags) ||
 	    get_user(data->time_queue, &data32->time_queue))
-		goto error;
+		return -EFAULT;
 	data->kernel = NULL;
 
-	fs = snd_enter_user();
-	err = snd_seq_do_ioctl(client, cmd, data);
-	snd_leave_user(fs);
+	err = snd_seq_kernel_client_ctl(client->number, cmd, data);
 	if (err < 0)
-		goto error;
+		return err;
 
 	if (copy_to_user(data32, data, sizeof(*data32)) ||
 	    put_user(data->flags, &data32->flags) ||
 	    put_user(data->time_queue, &data32->time_queue))
-		err = -EFAULT;
+		return -EFAULT;
 
- error:
-	kfree(data);
 	return err;
 }
 
@@ -80,26 +62,30 @@ static int snd_seq_call_port_info_ioctl(client_t *client, unsigned int cmd,
  */
 
 enum {
-	SNDRV_SEQ_IOCTL_CREATE_PORT32 = _IOWR('S', 0x20, struct sndrv_seq_port_info32),
-	SNDRV_SEQ_IOCTL_DELETE_PORT32 = _IOW ('S', 0x21, struct sndrv_seq_port_info32),
-	SNDRV_SEQ_IOCTL_GET_PORT_INFO32 = _IOWR('S', 0x22, struct sndrv_seq_port_info32),
-	SNDRV_SEQ_IOCTL_SET_PORT_INFO32 = _IOW ('S', 0x23, struct sndrv_seq_port_info32),
-	SNDRV_SEQ_IOCTL_QUERY_NEXT_PORT32 = _IOWR('S', 0x52, struct sndrv_seq_port_info32),
+	SNDRV_SEQ_IOCTL_CREATE_PORT32 = _IOWR('S', 0x20, struct snd_seq_port_info32),
+	SNDRV_SEQ_IOCTL_DELETE_PORT32 = _IOW ('S', 0x21, struct snd_seq_port_info32),
+	SNDRV_SEQ_IOCTL_GET_PORT_INFO32 = _IOWR('S', 0x22, struct snd_seq_port_info32),
+	SNDRV_SEQ_IOCTL_SET_PORT_INFO32 = _IOW ('S', 0x23, struct snd_seq_port_info32),
+	SNDRV_SEQ_IOCTL_QUERY_NEXT_PORT32 = _IOWR('S', 0x52, struct snd_seq_port_info32),
 };
 
 static long snd_seq_ioctl_compat(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	client_t *client = (client_t *) file->private_data;
+	struct snd_seq_client *client = file->private_data;
 	void __user *argp = compat_ptr(arg);
 
-	snd_assert(client != NULL, return -ENXIO);
+	if (snd_BUG_ON(!client))
+		return -ENXIO;
 
 	switch (cmd) {
 	case SNDRV_SEQ_IOCTL_PVERSION:
+	case SNDRV_SEQ_IOCTL_USER_PVERSION:
 	case SNDRV_SEQ_IOCTL_CLIENT_ID:
 	case SNDRV_SEQ_IOCTL_SYSTEM_INFO:
 	case SNDRV_SEQ_IOCTL_GET_CLIENT_INFO:
 	case SNDRV_SEQ_IOCTL_SET_CLIENT_INFO:
+	case SNDRV_SEQ_IOCTL_GET_CLIENT_UMP_INFO:
+	case SNDRV_SEQ_IOCTL_SET_CLIENT_UMP_INFO:
 	case SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT:
 	case SNDRV_SEQ_IOCTL_UNSUBSCRIBE_PORT:
 	case SNDRV_SEQ_IOCTL_CREATE_QUEUE:
@@ -121,7 +107,7 @@ static long snd_seq_ioctl_compat(struct file *file, unsigned int cmd, unsigned l
 	case SNDRV_SEQ_IOCTL_GET_SUBSCRIPTION:
 	case SNDRV_SEQ_IOCTL_QUERY_NEXT_CLIENT:
 	case SNDRV_SEQ_IOCTL_RUNNING_MODE:
-		return snd_seq_do_ioctl(client, cmd, argp);
+		return snd_seq_ioctl(file, cmd, arg);
 	case SNDRV_SEQ_IOCTL_CREATE_PORT32:
 		return snd_seq_call_port_info_ioctl(client, SNDRV_SEQ_IOCTL_CREATE_PORT, argp);
 	case SNDRV_SEQ_IOCTL_DELETE_PORT32:

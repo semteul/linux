@@ -1,17 +1,9 @@
-config ICST525
-	bool
-
-config ICST307
-	bool
-
+# SPDX-License-Identifier: GPL-2.0
 config SA1111
 	bool
-	select DMABOUNCE
+	select ZONE_DMA if ARCH_SA1100
 
-config DMABOUNCE
-	bool
-
-config TIMER_ACORN
+config KRAIT_L2_ACCESSORS
 	bool
 
 config SHARP_LOCOMO

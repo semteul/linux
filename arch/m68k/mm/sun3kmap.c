@@ -8,21 +8,19 @@
  * for more details.
  */
 
+#include <linux/module.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
 
 #include <asm/page.h>
-#include <asm/pgtable.h>
 #include <asm/io.h>
 #include <asm/sun3mmu.h>
 
-#undef SUN3_KMAP_DEBUG
+#include "../sun3/sun3.h"
 
-#ifdef SUN3_KMAP_DEBUG
-extern void print_pte_vaddr(unsigned long vaddr);
-#endif
+#undef SUN3_KMAP_DEBUG
 
 extern void mmu_emu_map_pmeg (int context, int vaddr);
 
@@ -39,6 +37,7 @@ static inline void do_page_mapin(unsigned long phys, unsigned long virt,
 	sun3_put_pte(virt, pte);
 
 #ifdef SUN3_KMAP_DEBUG
+	pr_info("mapin:");
 	print_pte_vaddr(virt);
 #endif
 
@@ -59,7 +58,7 @@ static inline void do_pmeg_mapin(unsigned long phys, unsigned long virt,
 	}
 }
 
-void *sun3_ioremap(unsigned long phys, unsigned long size,
+void __iomem *sun3_ioremap(unsigned long phys, unsigned long size,
 		   unsigned long type)
 {
 	struct vm_struct *area;
@@ -79,8 +78,8 @@ void *sun3_ioremap(unsigned long phys, unsigned long size,
 		return NULL;
 
 #ifdef SUN3_KMAP_DEBUG
-	printk("ioremap: got virt %p size %lx(%lx)\n",
-	       area->addr, size, area->size);
+	pr_info("ioremap: got virt %p size %lx(%lx)\n", area->addr, size,
+		area->size);
 #endif
 
 	pages = size / PAGE_SIZE;
@@ -101,22 +100,25 @@ void *sun3_ioremap(unsigned long phys, unsigned long size,
 		virt += seg_pages * PAGE_SIZE;
 	}
 
-	return (void *)ret;
+	return (void __iomem *)ret;
 
 }
+EXPORT_SYMBOL(sun3_ioremap);
 
 
-void *__ioremap(unsigned long phys, unsigned long size, int cache)
+void __iomem *__ioremap(unsigned long phys, unsigned long size, int cache)
 {
 
 	return sun3_ioremap(phys, size, SUN3_PAGE_TYPE_IO);
 
 }
+EXPORT_SYMBOL(__ioremap);
 
-void iounmap(void *addr)
+void iounmap(void __iomem *addr)
 {
 	vfree((void *)(PAGE_MASK & (unsigned long)addr));
 }
+EXPORT_SYMBOL(iounmap);
 
 /* sun3_map_test(addr, val) -- Reads a byte from addr, storing to val,
  * trapping the potential read fault.  Returns 0 if the access faulted,
@@ -154,3 +156,4 @@ int sun3_map_test(unsigned long addr, char *val)
 
 	return ret;
 }
+EXPORT_SYMBOL(sun3_map_test);

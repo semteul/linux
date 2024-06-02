@@ -2,7 +2,7 @@
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
  *
- * Copyright (C) 1999 by Helge Deller
+ * Copyright (C) 1999-2007 by Helge Deller <deller@gmx.de>
  * Copyright 1999 SuSE GmbH (Philipp Rumpf)
  * Copyright 1999 Philipp Rumpf (prumpf@tux.org)
  * Copyright 2000 Hewlett Packard (Paul Bame, bame@puffin.external.hp.com)
@@ -12,38 +12,37 @@
  * Initial Version 04-23-1999 by Helge Deller <deller@gmx.de>
  */
 
-#include <linux/autoconf.h>	/* for CONFIG_SMP */
-
-#include <asm/offsets.h>
+#include <asm/asm-offsets.h>
 #include <asm/psw.h>
 #include <asm/pdc.h>
 	
 #include <asm/assembly.h>
-#include <asm/pgtable.h>
 
-	.level	LEVEL
+#include <linux/linkage.h>
+#include <linux/init.h>
+#include <linux/pgtable.h>
 
-	.data
+	.level	1.1
 
-	.export boot_args
-boot_args:
+	__INITDATA
+ENTRY(boot_args)
 	.word 0 /* arg0 */
 	.word 0 /* arg1 */
 	.word 0 /* arg2 */
 	.word 0 /* arg3 */
+END(boot_args)
 
-	.text
+	__HEAD
+
 	.align	4
-	.import init_thread_union,data
+	.import init_task,data
+	.import init_stack,data
 	.import fault_vector_20,code    /* IVA parisc 2.0 32 bit */
-#ifndef __LP64__
+#ifndef CONFIG_64BIT
         .import fault_vector_11,code    /* IVA parisc 1.1 32 bit */
 	.import	$global$		/* forward declaration */
-#endif /*!LP64*/
-	.export stext
-	.export _stext,data		/* Kernel want it this way! */
-_stext:
-stext:
+#endif /*!CONFIG_64BIT*/
+ENTRY(parisc_kernel_start)
 	.proc
 	.callinfo
 
@@ -71,21 +70,61 @@ $bss_loop:
 	stw,ma          %arg2,4(%r1)
 	stw,ma          %arg3,4(%r1)
 
-	/* Initialize startup VM. Just map first 8/16 MB of memory */
+#if defined(CONFIG_PA20)
+	/* check for 64-bit capable CPU as required by current kernel */
+	ldi		32,%r10
+	mtctl		%r10,%cr11
+	.level 2.0
+	mfctl,w		%cr11,%r10
+	.level 1.1
+	comib,<>,n	0,%r10,$cpu_ok
+
+	load32		PA(msg1),%arg0
+	ldi		msg1_end-msg1,%arg1
+$iodc_panic:
+	copy		%arg0, %r10
+	copy		%arg1, %r11
+	load32		PA(init_stack),%sp
+#define MEM_CONS 0x3A0
+	ldw		MEM_CONS+32(%r0),%arg0	// HPA
+	ldi		ENTRY_IO_COUT,%arg1
+	ldw		MEM_CONS+36(%r0),%arg2	// SPA
+	ldw		MEM_CONS+8(%r0),%arg3	// layers
+	load32		PA(__bss_start),%r1
+	stw		%r1,-52(%sp)		// arg4
+	stw		%r0,-56(%sp)		// arg5
+	stw		%r10,-60(%sp)		// arg6 = ptr to text
+	stw		%r11,-64(%sp)		// arg7 = len
+	stw		%r0,-68(%sp)		// arg8
+	load32		PA(.iodc_panic_ret), %rp
+	ldw		MEM_CONS+40(%r0),%r1	// ENTRY_IODC
+	bv,n		(%r1)
+.iodc_panic_ret:
+	b .				/* wait endless with ... */
+	or		%r10,%r10,%r10	/* qemu idle sleep */
+msg1:	.ascii "Can't boot kernel which was built for PA8x00 CPUs on this machine.\r\n"
+msg1_end:
+
+$cpu_ok:
+#endif
+
+	.level	PA_ASM_LEVEL
+
+	/* Initialize startup VM. Just map first 16/32 MB of memory */
 	load32		PA(swapper_pg_dir),%r4
 	mtctl		%r4,%cr24	/* Initialize kernel root pointer */
 	mtctl		%r4,%cr25	/* Initialize user root pointer */
 
-#ifdef __LP64__
+#if CONFIG_PGTABLE_LEVELS == 3
 	/* Set pmd in pgd */
 	load32		PA(pmd0),%r5
 	shrd            %r5,PxD_VALUE_SHIFT,%r3	
-        ldo             (PxD_FLAG_PRESENT+PxD_FLAG_VALID)(%r3),%r3	
+	ldo		(PxD_FLAG_PRESENT+PxD_FLAG_VALID)(%r3),%r3
 	stw		%r3,ASM_PGD_ENTRY*ASM_PGD_ENTRY_SIZE(%r4)
 	ldo		ASM_PMD_ENTRY*ASM_PMD_ENTRY_SIZE(%r5),%r4
 #else
 	/* 2-level page table, so pmd == pgd */
-        ldo             ASM_PGD_ENTRY*ASM_PGD_ENTRY_SIZE(%r4),%r4
+	ldo		ASM_PGD_ENTRY*ASM_PGD_ENTRY_SIZE(%r4),%r4
 #endif
 
 	/* Fill in pmd with enough pte directories */
@@ -97,44 +136,61 @@ $bss_loop:
 
 1:
 	stw		%r3,0(%r4)
-	ldo		(ASM_PAGE_SIZE >> PxD_VALUE_SHIFT)(%r3),%r3
+	ldo		(PAGE_SIZE >> PxD_VALUE_SHIFT)(%r3),%r3
 	addib,>		-1,%r1,1b
-#ifdef __LP64__
+#if CONFIG_PGTABLE_LEVELS == 3
 	ldo             ASM_PMD_ENTRY_SIZE(%r4),%r4
 #else
 	ldo             ASM_PGD_ENTRY_SIZE(%r4),%r4
 #endif
 
 
-	/* Now initialize the PTEs themselves */
-	ldo		_PAGE_KERNEL(%r0),%r3 /* Hardwired 0 phys addr start */
+	/* Now initialize the PTEs themselves.  We use RWX for
+	 * everything ... it will get remapped correctly later */
+	ldo		0+_PAGE_KERNEL_RWX(%r0),%r3 /* Hardwired 0 phys addr start */
+	load32		(1<<(KERNEL_INITIAL_ORDER-PAGE_SHIFT)),%r11 /* PFN count */
 	load32		PA(pg0),%r1
 
 $pgt_fill_loop:
 	STREGM          %r3,ASM_PTE_ENTRY_SIZE(%r1)
-	ldo		ASM_PAGE_SIZE(%r3),%r3
-	bb,>=		%r3,31-KERNEL_INITIAL_ORDER,$pgt_fill_loop
+	ldo		(1<<PFN_PTE_SHIFT)(%r3),%r3 /* add one PFN */
+	addib,>		-1,%r11,$pgt_fill_loop
 	nop
 
 	/* Load the return address...er...crash 'n burn */
 	copy		%r0,%r2
 
 	/* And the RFI Target address too */
-	load32		start_kernel,%r11
+	load32		start_parisc,%r11
 
 	/* And the initial task pointer */
-	load32		init_thread_union,%r6
+	load32		init_task,%r6
 	mtctl           %r6,%cr30
 
 	/* And the stack pointer too */
-	ldo             THREAD_SZ_ALGN(%r6),%sp
+	load32		init_stack,%sp
+	tophys_r1	%sp
+#if defined(CONFIG_64BIT) && defined(CONFIG_FUNCTION_TRACER)
+	.import _mcount,data
+	/* initialize mcount FPTR */
+	/* Get the global data pointer */
+	loadgp
+	load32		PA(_mcount), %r10
+	std		%dp,0x18(%r10)
+#endif
 
-	/* And the interrupt stack */
-	load32		interrupt_stack,%r6
-	mtctl           %r6,%cr31
+#define MEM_PDC_LO 0x388
+#define MEM_PDC_HI 0x35C
+#ifdef CONFIG_64BIT
+	/* Get PDCE_PROC for monarch CPU. */
+	ldw             MEM_PDC_LO(%r0),%r3
+	ldw             MEM_PDC_HI(%r0),%r10
+	depd            %r10, 31, 32, %r3        /* move to upper word */
+#endif
+
 
 #ifdef CONFIG_SMP
-	/* Set the smp rendevous address into page zero.
+	/* Set the smp rendezvous address into page zero.
 	** It would be safer to do this in init_smp_config() but
 	** it's just way easier to deal with here because
 	** of 64-bit function ptrs and the address is local to this file.
@@ -145,6 +201,15 @@ $pgt_fill_loop:
 
 	/* FALLTHROUGH */
 	.procend
+
+#ifdef CONFIG_HOTPLUG_CPU
+	/* common_stext is far away in another section... jump there */
+	load32		PA(common_stext), %rp
+	bv,n		(%rp)
+
+	/* common_stext and smp_slave_stext needs to be in text section */
+	.text
+#endif
 
 	/*
 	** Code Common to both Monarch and Slave processors.
@@ -170,13 +235,12 @@ common_stext:
 	stw		%r0,0x28(%r0)	/* MEM_RENDEZ_HI */
 #endif /*CONFIG_SMP*/
 
-#ifdef __LP64__
-	tophys_r1	%sp
+#ifdef CONFIG_64BIT
+	mfctl		%cr30,%r6		/* PCX-W2 firmware bug */
+	tophys_r1	%r6
 
 	/* Save the rfi target address */
-	ldd             TI_TASK-THREAD_SZ_ALGN(%sp), %r10
-	tophys_r1       %r10
-	std             %r11,  TASK_PT_GR11(%r10)
+	STREG		%r11,  TASK_PT_GR11(%r6)
 	/* Switch to wide mode Superdome doesn't support narrow PDC
 	** calls.
 	*/
@@ -191,11 +255,6 @@ common_stext:
         ** Someday, palo might not do this for the Monarch either.
         */
 2:
-#define MEM_PDC_LO 0x388
-#define MEM_PDC_HI 0x35C
-	ldw             MEM_PDC_LO(%r0),%r3
-	ldw             MEM_PDC_HI(%r0),%r6
-	depd            %r6, 31, 32, %r3        /* move to upper word */
 
 	ldo             PDC_PSW(%r0),%arg0              /* 21 */
 	ldo             PDC_PSW_SET_DEFAULTS(%r0),%arg1 /* 2 */
@@ -205,13 +264,21 @@ common_stext:
 	copy            %r0,%arg3
 
 stext_pdc_ret:
-	/* restore rfi target address*/
-	ldd             TI_TASK-THREAD_SZ_ALGN(%sp), %r10
-	tophys_r1       %r10
-	ldd             TASK_PT_GR11(%r10), %r11
-	tovirt_r1       %sp
+	LDREG		TASK_PT_GR11(%r6), %r11
+	tovirt_r1	%r6
+	mtctl		%r6,%cr30		/* restore task thread info */
 #endif
-	
+
+#ifndef CONFIG_64BIT
+	/* clear all BTLBs */
+	ldi		PDC_BLOCK_TLB,%arg0
+	load32          PA(stext_pdc_btlb_ret), %rp
+	ldw             MEM_PDC_LO(%r0),%r3
+	bv              (%r3)
+	ldi		PDC_BTLB_PURGE_ALL,%arg1
+stext_pdc_btlb_ret:
+#endif
+
 	/* PARANOID: clear user scratch/user space SR's */
 	mtsp	%r0,%sr0
 	mtsp	%r0,%sr1
@@ -224,8 +291,6 @@ stext_pdc_ret:
 	mtctl	%r0,%cr12
 	mtctl	%r0,%cr13
 
-	/* Prepare to RFI! Man all the cannons! */
-
 	/* Initialize the global data pointer */
 	loadgp
 
@@ -235,7 +300,7 @@ stext_pdc_ret:
 	 * following short sequence of instructions can determine this
 	 * (without being illegal on a PA1.1 machine).
 	 */
-#ifndef __LP64__
+#ifndef CONFIG_64BIT
 	ldi		32,%r10
 	mtctl		%r10,%cr11
 	.level 2.0
@@ -247,53 +312,25 @@ stext_pdc_ret:
 	ldo		R%PA(fault_vector_11)(%r10),%r10
 
 $is_pa20:
-	.level		LEVEL /* restore 1.1 || 2.0w */
-#endif /*!LP64*/
+	.level		PA_ASM_LEVEL /* restore 1.1 || 2.0w */
+#endif /*!CONFIG_64BIT*/
 	load32		PA(fault_vector_20),%r10
 
 $install_iva:
 	mtctl		%r10,%cr14
 
-#ifdef __LP64__
-	b		aligned_rfi
+	b		aligned_rfi  /* Prepare to RFI! Man all the cannons! */
 	nop
 
-	.align          256
+	.align 128
 aligned_rfi:
-	ssm             0,0
-	nop             /* 1 */
-	nop             /* 2 */
-	nop             /* 3 */
-	nop             /* 4 */
-	nop             /* 5 */
-	nop             /* 6 */
-	nop             /* 7 */
-	nop             /* 8 */
-#endif
+	pcxt_ssm_bug
 
-#ifdef __LP64__ /* move to psw.h? */
-#define		PSW_BITS	PSW_Q+PSW_I+PSW_D+PSW_P+PSW_R
-#else
-#define		PSW_BITS	PSW_SM_Q
-#endif
+	copy		%r3, %arg0	/* PDCE_PROC for smp_callin() */
 
-$rfi:	
-	/* turn off troublesome PSW bits */
-	rsm		PSW_BITS,%r0
+	rsm		PSW_SM_QUIET,%r0	/* off troublesome PSW bits */
+	/* Don't need NOPs, have 8 compliant insn before rfi */
 
-	/* kernel PSW:
-	 *  - no interruptions except HPMC and TOC (which are handled by PDC)
-	 *  - Q bit set (IODC / PDC interruptions)
-	 *  - big-endian
-	 *  - virtually mapped
-	 */
-	load32		KERNEL_PSW,%r10
-	mtctl		%r10,%ipsw
-
-	/* Set the space pointers for the post-RFI world
-	** Clear the two-level IIA Space Queue, effectively setting
-	** Kernel space.
-	*/
 	mtctl		%r0,%cr17	/* Clear IIASQ tail */
 	mtctl		%r0,%cr17	/* Clear IIASQ head */
 
@@ -301,8 +338,13 @@ $rfi:
 	mtctl		%r11,%cr18	/* IIAOQ head */
 	ldo		4(%r11),%r11
 	mtctl		%r11,%cr18	/* IIAOQ tail */
-	
-	/* Jump to hyperspace */
+
+	load32		KERNEL_PSW,%r10
+	mtctl		%r10,%ipsw
+
+	tovirt_r1	%sp
+
+	/* Jump through hyperspace to Virt Mode */
 	rfi
 	nop
 
@@ -313,7 +355,7 @@ $rfi:
 	.import smp_init_current_idle_task,data
 	.import	smp_callin,code
 
-#ifndef __LP64__
+#ifndef CONFIG_64BIT
 smp_callin_rtn:
         .proc
 	.callinfo
@@ -321,7 +363,7 @@ smp_callin_rtn:
 	nop
 	nop
         .procend
-#endif /*!LP64*/
+#endif /*!CONFIG_64BIT*/
 
 /***************************************************************************
 * smp_slave_stext is executed by all non-monarch Processors when the Monarch
@@ -343,20 +385,34 @@ smp_slave_stext:
 	mtsp	   %r0,%sr6
 	mtsp	   %r0,%sr7
 
+#ifdef CONFIG_64BIT
+	/*
+	 *  Enable Wide mode early, in case the task_struct for the idle
+	 *  task in smp_init_current_idle_task was allocated above 4GB.
+	 */
+1:	mfia            %rp             /* clear upper part of pcoq */
+	ldo             2f-1b(%rp),%rp
+	depdi           0,31,32,%rp
+	bv              (%rp)
+	ssm             PSW_SM_W,%r0
+2:
+#endif
+
 	/*  Initialize the SP - monarch sets up smp_init_current_idle_task */
-	load32		PA(smp_init_current_idle_task),%sp
-	LDREG		0(%sp),%sp	/* load task address */
+	load32		PA(smp_init_current_idle_task),%r6
+	LDREG		0(%r6),%r6
+	mtctl		%r6,%cr30
+	tophys_r1	%r6
+	LDREG           TASK_STACK(%r6),%sp
 	tophys_r1	%sp
-	LDREG		TASK_THREAD_INFO(%sp),%sp
-	mtctl           %sp,%cr30       /* store in cr30 */
-	ldo             THREAD_SZ_ALGN(%sp),%sp
+	ldo		FRAME_SIZE(%sp),%sp
 
 	/* point CPU to kernel page tables */
 	load32		PA(swapper_pg_dir),%r4
 	mtctl		%r4,%cr24	/* Initialize kernel root pointer */
 	mtctl		%r4,%cr25	/* Initialize user root pointer */
 
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 	/* Setup PDCE_PROC entry */
 	copy            %arg0,%r3
 #else
@@ -373,8 +429,9 @@ smp_slave_stext:
 
 	.procend
 #endif /* CONFIG_SMP */
-#ifndef __LP64__
-	.data
+
+#ifndef CONFIG_64BIT
+	.section .data..ro_after_init
 
 	.align	4
 	.export	$global$,data
@@ -383,4 +440,4 @@ smp_slave_stext:
 	.size	$global$,4
 $global$:	
 	.word 0
-#endif /*!LP64*/
+#endif /*!CONFIG_64BIT*/

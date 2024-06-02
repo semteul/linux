@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_AD1816A_H
 #define __SOUND_AD1816A_H
 
@@ -5,24 +6,11 @@
     ad1816a.h - definitions for ADI SoundPort AD1816A chip.
     Copyright (C) 1999-2000 by Massimo Piccioni <dafastidio@libero.it>
 
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
 */
 
-#include "control.h"
-#include "pcm.h"
-#include "timer.h"
+#include <sound/control.h>
+#include <sound/pcm.h>
+#include <sound/timer.h>
 
 #define AD1816A_REG(r)			(chip->port + r)
 
@@ -123,9 +111,7 @@
 #define AD1816A_CAPTURE_NOT_EQUAL	0x1000
 #define AD1816A_WSS_ENABLE		0x8000
 
-typedef struct _snd_ad1816a ad1816a_t;
-
-struct _snd_ad1816a {
+struct snd_ad1816a {
 	unsigned long port;
 	struct resource *res_port;
 	int irq;
@@ -138,16 +124,20 @@ struct _snd_ad1816a {
 	spinlock_t lock;
 
 	unsigned short mode;
+	unsigned int clock_freq;
 
-	snd_card_t *card;
-	snd_pcm_t *pcm;
+	struct snd_card *card;
+	struct snd_pcm *pcm;
 
-	snd_pcm_substream_t *playback_substream;
-	snd_pcm_substream_t *capture_substream;
+	struct snd_pcm_substream *playback_substream;
+	struct snd_pcm_substream *capture_substream;
 	unsigned int p_dma_size;
 	unsigned int c_dma_size;
 
-	snd_timer_t *timer;
+	struct snd_timer *timer;
+#ifdef CONFIG_PM
+	unsigned short image[48];
+#endif
 };
 
 
@@ -164,11 +154,16 @@ struct _snd_ad1816a {
 				AD1816A_MODE_TIMER)
 
 
-extern int snd_ad1816a_create(snd_card_t *card, unsigned long port,
+extern int snd_ad1816a_create(struct snd_card *card, unsigned long port,
 			      int irq, int dma1, int dma2,
-			      ad1816a_t **chip);
+			      struct snd_ad1816a *chip);
 
-extern int snd_ad1816a_pcm(ad1816a_t *chip, int device, snd_pcm_t **rpcm);
-extern int snd_ad1816a_mixer(ad1816a_t *chip);
+extern int snd_ad1816a_pcm(struct snd_ad1816a *chip, int device);
+extern int snd_ad1816a_mixer(struct snd_ad1816a *chip);
+extern int snd_ad1816a_timer(struct snd_ad1816a *chip, int device);
+#ifdef CONFIG_PM
+extern void snd_ad1816a_suspend(struct snd_ad1816a *chip);
+extern void snd_ad1816a_resume(struct snd_ad1816a *chip);
+#endif
 
 #endif	/* __SOUND_AD1816A_H */

@@ -1,5 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
 #
 # Makefile for Linux arch/m68k/hp300 source directory
 #
 
-obj-y		:= ksyms.o config.o ints.o time.o reboot.o
+obj-y		:= config.o time.o reboot.o

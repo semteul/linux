@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/core_cia.c
  *
@@ -20,9 +21,10 @@
 #include <linux/pci.h>
 #include <linux/sched.h>
 #include <linux/init.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 
 #include <asm/ptrace.h>
+#include <asm/mce.h>
 
 #include "proto.h"
 #include "pci_impl.h"
@@ -278,7 +280,7 @@ cia_pci_tbi(struct pci_controller *hose, dma_addr_t start, dma_addr_t end)
 #define CIA_BROKEN_TBIA_SIZE	1024
 
 /* Always called with interrupts disabled */
-void
+static void
 cia_pci_tbi_try2(struct pci_controller *hose,
 		 dma_addr_t start, dma_addr_t end)
 {
@@ -329,7 +331,10 @@ cia_prepare_tbia_workaround(int window)
 	long i;
 
 	/* Use minimal 1K map. */
-	ppte = __alloc_bootmem(CIA_BROKEN_TBIA_SIZE, 32768, 0);
+	ppte = memblock_alloc(CIA_BROKEN_TBIA_SIZE, 32768);
+	if (!ppte)
+		panic("%s: Failed to allocate %u bytes align=0x%x\n",
+		      __func__, CIA_BROKEN_TBIA_SIZE, 32768);
 	pte = (virt_to_phys(ppte) >> (PAGE_SHIFT - 1)) | 1;
 
 	for (i = 0; i < CIA_BROKEN_TBIA_SIZE / sizeof(unsigned long); ++i)
@@ -522,7 +527,7 @@ verify_tb_operation(void)
 	if (use_tbia_try2) {
 		alpha_mv.mv_pci_tbi = cia_pci_tbi_try2;
 
-		/* Tags 0-3 must be disabled if we use this workaraund. */
+		/* Tags 0-3 must be disabled if we use this workaround. */
 		wmb();
 		*(vip)CIA_IOC_TB_TAGn(0) = 2;
 		*(vip)CIA_IOC_TB_TAGn(1) = 2;
@@ -571,7 +576,7 @@ struct
     } window[4];
 } saved_config __attribute((common));
 
-void
+static void
 cia_save_srm_settings(int is_pyxis)
 {
 	int i;
@@ -597,7 +602,7 @@ cia_save_srm_settings(int is_pyxis)
 	mb();
 }
 
-void
+static void
 cia_restore_srm_settings(void)
 {
 	int i;
@@ -1192,8 +1197,7 @@ cia_decode_mchk(unsigned long la_ptr)
 }
 
 void
-cia_machine_check(unsigned long vector, unsigned long la_ptr,
-		  struct pt_regs * regs)
+cia_machine_check(unsigned long vector, unsigned long la_ptr)
 {
 	int expected;
 
@@ -1208,5 +1212,5 @@ cia_machine_check(unsigned long vector, unsigned long la_ptr,
 	expected = mcheck_expected(0);
 	if (!expected && vector == 0x660)
 		expected = cia_decode_mchk(la_ptr);
-	process_mcheck_info(vector, la_ptr, regs, "CIA", expected);
+	process_mcheck_info(vector, la_ptr, "CIA", expected);
 }

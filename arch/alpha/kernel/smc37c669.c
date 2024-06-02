@@ -3,7 +3,6 @@
  */
 #include <linux/kernel.h>
 
-#include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/init.h>
 #include <linux/delay.h>
@@ -11,7 +10,8 @@
 
 #include <asm/hwrpb.h>
 #include <asm/io.h>
-#include <asm/segment.h>
+
+#include "proto.h"
 
 #if 0
 # define DBG_DEVS(args)         printk args
@@ -934,18 +934,6 @@ void SMC37c669_display_device_info(
  *
  *--
  */
-#if 0
-/* $INCLUDE_OPTIONS$ */
-#include    "cp$inc:platform_io.h"
-/* $INCLUDE_OPTIONS_END$ */
-#include    "cp$src:common.h"
-#include    "cp$inc:prototypes.h"
-#include    "cp$src:kernel_def.h"
-#include    "cp$src:msg_def.h"
-#include    "cp$src:smcc669_def.h"
-/* Platform-specific includes */
-#include    "cp$src:platform.h"
-#endif
 
 #ifndef TRUE
 #define TRUE 1
@@ -2020,11 +2008,8 @@ static void __init SMC37c669_config_mode(
 static unsigned char __init SMC37c669_read_config( 
     unsigned char index )
 {
-    unsigned char data;
-
-    wb( &SMC37c669->index_port, index );
-    data = rb( &SMC37c669->data_port );
-    return data;
+	wb(&SMC37c669->index_port, index);
+	return rb(&SMC37c669->data_port);
 }
 
 /*
@@ -2447,13 +2432,15 @@ int __init smcc669_write( struct FILE *fp, int size, int number, unsigned char *
 }
 #endif
 
-void __init
+#if SMC_DEBUG
+static void __init
 SMC37c669_dump_registers(void)
 {
   int i;
   for (i = 0; i <= 0x29; i++)
     printk("-- CR%02x : %02x\n", i, SMC37c669_read_config(i));
 }
+#endif
 /*+
  * ============================================================================
  * = SMC_init - SMC37c669 Super I/O controller initialization                 =
@@ -2542,8 +2529,8 @@ void __init SMC669_Init ( int index )
         SMC37c669_display_device_info( );
 #endif
 	local_irq_restore(flags);
-        printk( "SMC37c669 Super I/O Controller found @ 0x%lx\n",
-		(unsigned long) SMC_base );
+        printk( "SMC37c669 Super I/O Controller found @ 0x%p\n",
+		SMC_base );
     }
     else {
 	local_irq_restore(flags);

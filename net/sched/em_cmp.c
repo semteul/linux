@@ -1,20 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * net/sched/em_cmp.c	Simple packet data comparison ematch
- *
- *		This program is free software; you can redistribute it and/or
- *		modify it under the terms of the GNU General Public License
- *		as published by the Free Software Foundation; either version
- *		2 of the License, or (at your option) any later version.
  *
  * Authors:	Thomas Graf <tgraf@suug.ch>
  */
 
-#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/skbuff.h>
 #include <linux/tc_ematch/tc_em_cmp.h>
+#include <asm/unaligned.h>
 #include <net/pkt_cls.h>
 
 static inline int cmp_needs_transformation(struct tcf_em_cmp *cmp)
@@ -33,44 +29,41 @@ static int em_cmp_match(struct sk_buff *skb, struct tcf_ematch *em,
 		return 0;
 
 	switch (cmp->align) {
-		case TCF_EM_ALIGN_U8:
-			val = *ptr;
-			break;
+	case TCF_EM_ALIGN_U8:
+		val = *ptr;
+		break;
 
-		case TCF_EM_ALIGN_U16:
-			val = *ptr << 8;
-			val |= *(ptr+1);
+	case TCF_EM_ALIGN_U16:
+		val = get_unaligned_be16(ptr);
 
-			if (cmp_needs_transformation(cmp))
-				val = be16_to_cpu(val);
-			break;
+		if (cmp_needs_transformation(cmp))
+			val = be16_to_cpu(val);
+		break;
 
-		case TCF_EM_ALIGN_U32:
-			/* Worth checking boundries? The branching seems
-			 * to get worse. Visit again. */
-			val = *ptr << 24;
-			val |= *(ptr+1) << 16;
-			val |= *(ptr+2) << 8;
-			val |= *(ptr+3);
+	case TCF_EM_ALIGN_U32:
+		/* Worth checking boundaries? The branching seems
+		 * to get worse. Visit again.
+		 */
+		val = get_unaligned_be32(ptr);
 
-			if (cmp_needs_transformation(cmp))
-				val = be32_to_cpu(val);
-			break;
+		if (cmp_needs_transformation(cmp))
+			val = be32_to_cpu(val);
+		break;
 
-		default:
-			return 0;
+	default:
+		return 0;
 	}
 
 	if (cmp->mask)
 		val &= cmp->mask;
 
 	switch (cmp->opnd) {
-		case TCF_EM_OPND_EQ:
-			return val == cmp->val;
-		case TCF_EM_OPND_LT:
-			return val < cmp->val;
-		case TCF_EM_OPND_GT:
-			return val > cmp->val;
+	case TCF_EM_OPND_EQ:
+		return val == cmp->val;
+	case TCF_EM_OPND_LT:
+		return val < cmp->val;
+	case TCF_EM_OPND_GT:
+		return val > cmp->val;
 	}
 
 	return 0;
@@ -89,13 +82,15 @@ static int __init init_em_cmp(void)
 	return tcf_em_register(&em_cmp_ops);
 }
 
-static void __exit exit_em_cmp(void) 
+static void __exit exit_em_cmp(void)
 {
 	tcf_em_unregister(&em_cmp_ops);
 }
 
+MODULE_DESCRIPTION("ematch classifier for basic data types(8/16/32 bit) against skb data");
 MODULE_LICENSE("GPL");
 
 module_init(init_em_cmp);
 module_exit(exit_em_cmp);
 
+MODULE_ALIAS_TCF_EMATCH(TCF_EM_CMP);

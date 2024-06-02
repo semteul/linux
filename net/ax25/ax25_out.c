@@ -1,40 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
  *
  * Copyright (C) Alan Cox GW4PTS (alan@lxorguk.ukuu.org.uk)
  * Copyright (C) Jonathan Naylor G4KLX (g4klx@g4klx.demon.co.uk)
  * Copyright (C) Joerg Reuter DL1BKE (jreuter@yaina.de)
  */
-#include <linux/config.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/socket.h>
 #include <linux/in.h>
 #include <linux/kernel.h>
-#include <linux/sched.h>
+#include <linux/module.h>
 #include <linux/timer.h>
 #include <linux/string.h>
 #include <linux/sockios.h>
 #include <linux/spinlock.h>
 #include <linux/net.h>
+#include <linux/slab.h>
 #include <net/ax25.h>
 #include <linux/inet.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
-#include <linux/netfilter.h>
 #include <net/sock.h>
-#include <asm/uaccess.h>
-#include <asm/system.h>
+#include <linux/uaccess.h>
 #include <linux/fcntl.h>
 #include <linux/mm.h>
 #include <linux/interrupt.h>
 
 static DEFINE_SPINLOCK(ax25_frag_lock);
 
-ax25_cb *ax25_send_frame(struct sk_buff *skb, int paclen, ax25_address *src, ax25_address *dest, ax25_digi *digi, struct net_device *dev)
+ax25_cb *ax25_send_frame(struct sk_buff *skb, int paclen, const ax25_address *src, ax25_address *dest, ax25_digi *digi, struct net_device *dev)
 {
 	ax25_dev *ax25_dev;
 	ax25_cb *ax25;
@@ -70,11 +65,11 @@ ax25_cb *ax25_send_frame(struct sk_buff *skb, int paclen, ax25_address *src, ax2
 	ax25->dest_addr   = *dest;
 
 	if (digi != NULL) {
-		if ((ax25->digipeat = kmalloc(sizeof(ax25_digi), GFP_ATOMIC)) == NULL) {
+		ax25->digipeat = kmemdup(digi, sizeof(*digi), GFP_ATOMIC);
+		if (ax25->digipeat == NULL) {
 			ax25_cb_put(ax25);
 			return NULL;
 		}
-		memcpy(ax25->digipeat, digi, sizeof(ax25_digi));
 	}
 
 	switch (ax25->ax25_dev->values[AX25_VALUES_PROTOCOL]) {
@@ -93,6 +88,12 @@ ax25_cb *ax25_send_frame(struct sk_buff *skb, int paclen, ax25_address *src, ax2
 #endif
 	}
 
+	/*
+	 * There is one ref for the state machine; a caller needs
+	 * one more to put it back, just like with the existing one.
+	 */
+	ax25_cb_hold(ax25);
+
 	ax25_cb_add(ax25);
 
 	ax25->state = AX25_STATE_1;
@@ -103,6 +104,8 @@ ax25_cb *ax25_send_frame(struct sk_buff *skb, int paclen, ax25_address *src, ax2
 
 	return ax25;			/* We had to create it */
 }
+
+EXPORT_SYMBOL(ax25_send_frame);
 
 /*
  *	All outgoing AX.25 I frames pass via this routine. Therefore this is
@@ -115,6 +118,12 @@ void ax25_output(ax25_cb *ax25, int paclen, struct sk_buff *skb)
 	struct sk_buff *skbn;
 	unsigned char *p;
 	int frontlen, len, fragno, ka9qfrag, first = 1;
+
+	if (paclen < 16) {
+		WARN_ON_ONCE(1);
+		kfree_skb(skb);
+		return;
+	}
 
 	if ((skb->len - 1) > paclen) {
 		if (*skb->data == AX25_P_TEXT) {
@@ -147,8 +156,9 @@ void ax25_output(ax25_cb *ax25, int paclen, struct sk_buff *skb)
 
 			if (ka9qfrag == 1) {
 				skb_reserve(skbn, frontlen + 2);
-				skbn->nh.raw = skbn->data + (skb->nh.raw - skb->data);
-				memcpy(skb_put(skbn, len), skb->data, len);
+				skb_set_network_header(skbn,
+						      skb_network_offset(skb));
+				skb_copy_from_linear_data(skb, skb_put(skbn, len), len);
 				p = skb_push(skbn, 2);
 
 				*p++ = AX25_P_SEGMENT;
@@ -160,8 +170,9 @@ void ax25_output(ax25_cb *ax25, int paclen, struct sk_buff *skb)
 				}
 			} else {
 				skb_reserve(skbn, frontlen + 1);
-				skbn->nh.raw = skbn->data + (skb->nh.raw - skb->data);
-				memcpy(skb_put(skbn, len), skb->data, len);
+				skb_set_network_header(skbn,
+						      skb_network_offset(skb));
+				skb_copy_from_linear_data(skb, skb_put(skbn, len), len);
 				p = skb_push(skbn, 1);
 				*p = AX25_P_TEXT;
 			}
@@ -204,7 +215,7 @@ static void ax25_send_iframe(ax25_cb *ax25, struct sk_buff *skb, int poll_bit)
 	if (skb == NULL)
 		return;
 
-	skb->nh.raw = skb->data;
+	skb_reset_network_header(skb);
 
 	if (ax25->modulus == AX25_MODULUS) {
 		frame = skb_push(skb, 1);
@@ -248,8 +259,6 @@ void ax25_kick(ax25_cb *ax25)
 	if (start == end)
 		return;
 
-	ax25->vs = start;
-
 	/*
 	 * Transmit data until either we're out of data to send or
 	 * the window is full. Send a poll on the final I frame if
@@ -258,8 +267,13 @@ void ax25_kick(ax25_cb *ax25)
 
 	/*
 	 * Dequeue the frame and copy it.
+	 * Check for race with ax25_clear_queues().
 	 */
 	skb  = skb_dequeue(&ax25->write_queue);
+	if (!skb)
+		return;
+
+	ax25->vs = start;
 
 	do {
 		if ((skbn = skb_clone(skb, GFP_ATOMIC)) == NULL) {
@@ -311,7 +325,6 @@ void ax25_kick(ax25_cb *ax25)
 
 void ax25_transmit_buffer(ax25_cb *ax25, struct sk_buff *skb, int type)
 {
-	struct sk_buff *skbn;
 	unsigned char *ptr;
 	int headroom;
 
@@ -322,18 +335,12 @@ void ax25_transmit_buffer(ax25_cb *ax25, struct sk_buff *skb, int type)
 
 	headroom = ax25_addr_size(ax25->digipeat);
 
-	if (skb_headroom(skb) < headroom) {
-		if ((skbn = skb_realloc_headroom(skb, headroom)) == NULL) {
+	if (unlikely(skb_headroom(skb) < headroom)) {
+		skb = skb_expand_head(skb, headroom);
+		if (!skb) {
 			printk(KERN_CRIT "AX.25: ax25_transmit_buffer - out of memory\n");
-			kfree_skb(skb);
 			return;
 		}
-
-		if (skb->sk != NULL)
-			skb_set_owner_w(skbn, skb->sk);
-
-		kfree_skb(skb);
-		skb = skbn;
 	}
 
 	ptr = skb_push(skb, headroom);
@@ -377,4 +384,3 @@ int ax25_check_iframes_acked(ax25_cb *ax25, unsigned short nr)
 	}
 	return 0;
 }
-

@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * arch/parisc/kernel/firmware.c  - safe PDC access routines
  *
  *	PDC == Processor Dependent Code
  *
- * See http://www.parisc-linux.org/documentation/index.html
+ * See PDC documentation at
+ * https://parisc.wiki.kernel.org/index.php/Technical_Documentation
  * for documentation describing the entry points and calling
  * conventions defined below.
  *
@@ -11,13 +13,7 @@
  * Copyright 1999 The Puffin Group, (Alex deVries, David Kennedy)
  * Copyright 2003 Grant Grundler <grundler parisc-linux org>
  * Copyright 2003,2004 Ryan Bradetich <rbrad@parisc-linux.org>
- * Copyright 2004 Thibaut VARENE <varenet@parisc-linux.org>
- *
- *    This program is free software; you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation; either version 2 of the License, or
- *    (at your option) any later version.
- *
+ * Copyright 2004,2006 Thibaut VARENE <varenet@parisc-linux.org>
  */
 
 /*	I think it would be in everyone's best interest to follow this
@@ -55,7 +51,7 @@
  *					prumpf	991016	
  */
 
-#include <stdarg.h>
+#include <linux/stdarg.h>
 
 #include <linux/delay.h>
 #include <linux/init.h>
@@ -67,39 +63,46 @@
 #include <asm/page.h>
 #include <asm/pdc.h>
 #include <asm/pdcpat.h>
-#include <asm/system.h>
 #include <asm/processor.h>	/* for boot_cpu_data */
 
+#if defined(BOOTLOADER)
+# undef  spin_lock_irqsave
+# define spin_lock_irqsave(a, b) { b = 1; }
+# undef  spin_unlock_irqrestore
+# define spin_unlock_irqrestore(a, b)
+#else
 static DEFINE_SPINLOCK(pdc_lock);
-static unsigned long pdc_result[32] __attribute__ ((aligned (8)));
-static unsigned long pdc_result2[32] __attribute__ ((aligned (8)));
-
-#ifdef __LP64__
-#define WIDE_FIRMWARE 0x1
-#define NARROW_FIRMWARE 0x2
-
-/* Firmware needs to be initially set to narrow to determine the 
- * actual firmware width. */
-int parisc_narrow_firmware = 1;
 #endif
 
-/* on all currently-supported platforms, IODC I/O calls are always
- * 32-bit calls, and MEM_PDC calls are always the same width as the OS.
- * This means Cxxx boxes can't run wide kernels right now. -PB
+static unsigned long pdc_result[NUM_PDC_RESULT]  __aligned(8);
+static unsigned long pdc_result2[NUM_PDC_RESULT] __aligned(8);
+
+#ifdef CONFIG_64BIT
+#define WIDE_FIRMWARE		PDC_MODEL_OS64
+#define NARROW_FIRMWARE		PDC_MODEL_OS32
+
+/* Firmware needs to be initially set to narrow to determine the
+ * actual firmware width. */
+int parisc_narrow_firmware __ro_after_init = NARROW_FIRMWARE;
+#endif
+
+/* On most currently-supported platforms, IODC I/O calls are 32-bit calls
+ * and MEM_PDC calls are always the same width as the OS.
+ * Some PAT boxes may have 64-bit IODC I/O.
  *
- * CONFIG_PDC_NARROW has been added to allow 64-bit kernels to run on
- * systems with 32-bit MEM_PDC calls. This will allow wide kernels to
- * run on Cxxx boxes now. -RB
- *
- * Note that some PAT boxes may have 64-bit IODC I/O...
+ * Ryan Bradetich added the now obsolete CONFIG_PDC_NARROW to allow
+ * 64-bit kernels to run on systems with 32-bit MEM_PDC calls.
+ * This allowed wide kernels to run on Cxxx boxes.
+ * We now detect 32-bit-only PDC and dynamically switch to 32-bit mode
+ * when running a 64-bit kernel on such boxes (e.g. C200 or C360).
  */
 
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 long real64_call(unsigned long function, ...);
 #endif
 long real32_call(unsigned long function, ...);
 
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 #   define MEM_PDC (unsigned long)(PAGE0->mem_pdc_hi) << 32 | PAGE0->mem_pdc
 #   define mem_pdc_call(args...) unlikely(parisc_narrow_firmware) ? real32_call(MEM_PDC, args) : real64_call(MEM_PDC, args)
 #else
@@ -117,13 +120,13 @@ long real32_call(unsigned long function, ...);
  */
 static unsigned long f_extend(unsigned long address)
 {
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 	if(unlikely(parisc_narrow_firmware)) {
 		if((address & 0xff000000) == 0xf0000000)
-			return 0xf0f0f0f000000000UL | (u32)address;
+			return (0xfffffff0UL << 32) | (u32)address;
 
 		if((address & 0xf0000000) == 0xf0000000)
-			return 0xffffffff00000000UL | (u32)address;
+			return (0xffffffffUL << 32) | (u32)address;
 	}
 #endif
 	return address;
@@ -131,7 +134,7 @@ static unsigned long f_extend(unsigned long address)
 
 /**
  * convert_to_wide - Convert the return buffer addresses into kernel addresses.
- * @address: The return buffer from PDC.
+ * @addr: The return buffer from PDC.
  *
  * This function is used to convert the return buffer addresses retrieved from PDC
  * into kernel addresses when the PDC address size and kernel address size are
@@ -139,37 +142,63 @@ static unsigned long f_extend(unsigned long address)
  */
 static void convert_to_wide(unsigned long *addr)
 {
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 	int i;
 	unsigned int *p = (unsigned int *)addr;
 
-	if(unlikely(parisc_narrow_firmware)) {
-		for(i = 31; i >= 0; --i)
+	if (unlikely(parisc_narrow_firmware)) {
+		for (i = (NUM_PDC_RESULT-1); i >= 0; --i)
 			addr[i] = p[i];
 	}
 #endif
 }
 
-/**
- * set_firmware_width - Determine if the firmware is wide or narrow.
- * 
- * This function must be called before any pdc_* function that uses the convert_to_wide
- * function.
- */
-void __init set_firmware_width(void)
+#ifdef CONFIG_64BIT
+void set_firmware_width_unlocked(void)
 {
-#ifdef __LP64__
-	int retval;
+	int ret;
 
-        spin_lock_irq(&pdc_lock);
-	retval = mem_pdc_call(PDC_MODEL, PDC_MODEL_CAPABILITIES, __pa(pdc_result), 0);
+	ret = mem_pdc_call(PDC_MODEL, PDC_MODEL_CAPABILITIES,
+		__pa(pdc_result), 0);
+	if (ret < 0)
+		return;
 	convert_to_wide(pdc_result);
-	if(pdc_result[0] != NARROW_FIRMWARE)
+	if (pdc_result[0] != NARROW_FIRMWARE)
 		parisc_narrow_firmware = 0;
-        spin_unlock_irq(&pdc_lock);
-#endif
 }
 
+/**
+ * set_firmware_width - Determine if the firmware is wide or narrow.
+ *
+ * This function must be called before any pdc_* function that uses the
+ * convert_to_wide function.
+ */
+void set_firmware_width(void)
+{
+	unsigned long flags;
+
+	/* already initialized? */
+	if (parisc_narrow_firmware != NARROW_FIRMWARE)
+		return;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	set_firmware_width_unlocked();
+	spin_unlock_irqrestore(&pdc_lock, flags);
+}
+#else
+void set_firmware_width_unlocked(void)
+{
+	return;
+}
+
+void set_firmware_width(void)
+{
+	return;
+}
+#endif /*CONFIG_64BIT*/
+
+
+#if !defined(BOOTLOADER)
 /**
  * pdc_emergency_unlock - Unlock the linux pdc lock
  *
@@ -196,19 +225,40 @@ void pdc_emergency_unlock(void)
 int pdc_add_valid(unsigned long address)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         retval = mem_pdc_call(PDC_ADD_VALID, PDC_ADD_VALID_VERIFY, address);
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
 EXPORT_SYMBOL(pdc_add_valid);
 
 /**
+ * pdc_instr - Get instruction that invokes PDCE_CHECK in HPMC handler.
+ * @instr: Pointer to variable which will get instruction opcode.
+ *
+ * The return value is PDC_OK (0) in case call succeeded.
+ */
+int __init pdc_instr(unsigned int *instr)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_INSTR, 0UL, __pa(pdc_result));
+	convert_to_wide(pdc_result);
+	*instr = pdc_result[0];
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
+/**
  * pdc_chassis_info - Return chassis information.
- * @result: The return buffer.
  * @chassis_info: The memory buffer address.
+ * @led_info: The size of the memory buffer address.
  * @len: The size of the memory buffer address.
  *
  * An HVERSION dependent call for returning the chassis information.
@@ -216,56 +266,138 @@ EXPORT_SYMBOL(pdc_add_valid);
 int __init pdc_chassis_info(struct pdc_chassis_info *chassis_info, void *led_info, unsigned long len)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         memcpy(&pdc_result, chassis_info, sizeof(*chassis_info));
         memcpy(&pdc_result2, led_info, len);
         retval = mem_pdc_call(PDC_CHASSIS, PDC_RETURN_CHASSIS_INFO,
                               __pa(pdc_result), __pa(pdc_result2), len);
         memcpy(chassis_info, pdc_result, sizeof(*chassis_info));
         memcpy(led_info, pdc_result2, len);
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
 
 /**
  * pdc_pat_chassis_send_log - Sends a PDC PAT CHASSIS log message.
- * @retval: -1 on error, 0 on success. Other value are PDC errors
+ * @state: state of the machine
+ * @data: value for that state
  * 
  * Must be correctly formatted or expect system crash
  */
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 int pdc_pat_chassis_send_log(unsigned long state, unsigned long data)
 {
 	int retval = 0;
+	unsigned long flags;
         
 	if (!is_pdc_pat())
 		return -1;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_CHASSIS_LOG, PDC_PAT_CHASSIS_WRITE_LOG, __pa(&state), __pa(&data));
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
 #endif
 
 /**
- * pdc_chassis_disp - Updates display
- * @retval: -1 on error, 0 on success
- *
- * Works on old PDC only (E class, others?)
+ * pdc_chassis_disp - Updates chassis code
+ * @disp: value to show on display
  */
 int pdc_chassis_disp(unsigned long disp)
 {
 	int retval = 0;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_CHASSIS, PDC_CHASSIS_DISP, disp);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
+}
+
+/**
+ * __pdc_cpu_rendezvous - Stop currently executing CPU and do not return.
+ */
+int __pdc_cpu_rendezvous(void)
+{
+	if (is_pdc_pat())
+		return mem_pdc_call(PDC_PAT_CPU, PDC_PAT_CPU_RENDEZVOUS);
+	else
+		return mem_pdc_call(PDC_PROC, 1, 0);
+}
+
+/**
+ * pdc_cpu_rendezvous_lock - Lock PDC while transitioning to rendezvous state
+ */
+void pdc_cpu_rendezvous_lock(void) __acquires(&pdc_lock)
+{
+	spin_lock(&pdc_lock);
+}
+
+/**
+ * pdc_cpu_rendezvous_unlock - Unlock PDC after reaching rendezvous state
+ */
+void pdc_cpu_rendezvous_unlock(void) __releases(&pdc_lock)
+{
+	spin_unlock(&pdc_lock);
+}
+
+/**
+ * pdc_pat_get_PDC_entrypoint - Get PDC entry point for current CPU
+ * @pdc_entry: pointer to where the PDC entry point should be stored
+ */
+int pdc_pat_get_PDC_entrypoint(unsigned long *pdc_entry)
+{
+	int retval = 0;
+	unsigned long flags;
+
+	if (!IS_ENABLED(CONFIG_SMP) || !is_pdc_pat()) {
+		*pdc_entry = MEM_PDC;
+		return 0;
+	}
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PAT_CPU, PDC_PAT_CPU_GET_PDC_ENTRYPOINT,
+			__pa(pdc_result));
+	*pdc_entry = pdc_result[0];
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+/**
+ * pdc_chassis_warn - Fetches chassis warnings
+ * @warn: The warning value to be shown
+ */
+int pdc_chassis_warn(unsigned long *warn)
+{
+	int retval = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_CHASSIS, PDC_CHASSIS_WARN, __pa(pdc_result));
+	*warn = pdc_result[0];
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
+int pdc_coproc_cfg_unlocked(struct pdc_coproc_cfg *pdc_coproc_info)
+{
+	int ret;
+
+	ret = mem_pdc_call(PDC_COPROC, PDC_COPROC_CFG, __pa(pdc_result));
+	convert_to_wide(pdc_result);
+	pdc_coproc_info->ccr_functional = pdc_result[0];
+	pdc_coproc_info->ccr_present = pdc_result[1];
+	pdc_coproc_info->revision = pdc_result[17];
+	pdc_coproc_info->model = pdc_result[18];
+
+	return ret;
 }
 
 /**
@@ -275,20 +407,16 @@ int pdc_chassis_disp(unsigned long disp)
  * This PDC call returns the presence and status of all the coprocessors
  * attached to the processor.
  */
-int __init pdc_coproc_cfg(struct pdc_coproc_cfg *pdc_coproc_info)
+int pdc_coproc_cfg(struct pdc_coproc_cfg *pdc_coproc_info)
 {
-        int retval;
+	int ret;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
-        retval = mem_pdc_call(PDC_COPROC, PDC_COPROC_CFG, __pa(pdc_result));
-        convert_to_wide(pdc_result);
-        pdc_coproc_info->ccr_functional = pdc_result[0];
-        pdc_coproc_info->ccr_present = pdc_result[1];
-        pdc_coproc_info->revision = pdc_result[17];
-        pdc_coproc_info->model = pdc_result[18];
-        spin_unlock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
+	ret = pdc_coproc_cfg_unlocked(pdc_coproc_info);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
-        return retval;
+	return ret;
 }
 
 /**
@@ -306,14 +434,15 @@ int pdc_iodc_read(unsigned long *actcnt, unsigned long hpa, unsigned int index,
 		  void *iodc_data, unsigned int iodc_data_size)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_IODC, PDC_IODC_READ, __pa(pdc_result), hpa, 
 			      index, __pa(pdc_result2), iodc_data_size);
 	convert_to_wide(pdc_result);
 	*actcnt = pdc_result[0];
 	memcpy(iodc_data, pdc_result2, iodc_data_size);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -332,14 +461,15 @@ int pdc_system_map_find_mods(struct pdc_system_map_mod_info *pdc_mod_info,
 			     struct pdc_module_path *mod_path, long mod_index)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_SYSTEM_MAP, PDC_FIND_MODULE, __pa(pdc_result), 
 			      __pa(pdc_result2), mod_index);
 	convert_to_wide(pdc_result);
 	memcpy(pdc_mod_info, pdc_result, sizeof(*pdc_mod_info));
 	memcpy(mod_path, pdc_result2, sizeof(*mod_path));
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	pdc_mod_info->mod_addr = f_extend(pdc_mod_info->mod_addr);
 	return retval;
@@ -358,13 +488,14 @@ int pdc_system_map_find_addrs(struct pdc_system_map_addr_info *pdc_addr_info,
 			      long mod_index, long addr_index)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_SYSTEM_MAP, PDC_FIND_ADDRESS, __pa(pdc_result),
 			      mod_index, addr_index);
 	convert_to_wide(pdc_result);
 	memcpy(pdc_addr_info, pdc_result, sizeof(*pdc_addr_info));
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	pdc_addr_info->mod_addr = f_extend(pdc_addr_info->mod_addr);
 	return retval;
@@ -379,29 +510,34 @@ int pdc_system_map_find_addrs(struct pdc_system_map_addr_info *pdc_addr_info,
 int pdc_model_info(struct pdc_model *model) 
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_MODEL, PDC_MODEL_INFO, __pa(pdc_result), 0);
 	convert_to_wide(pdc_result);
 	memcpy(model, pdc_result, sizeof(*model));
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
 
 /**
  * pdc_model_sysmodel - Get the system model name.
+ * @os_id: The operating system ID asked for (an OS_ID_* value)
  * @name: A char array of at least 81 characters.
  *
- * Get system model name from PDC ROM (e.g. 9000/715 or 9000/778/B160L)
+ * Get system model name from PDC ROM (e.g. 9000/715 or 9000/778/B160L).
+ * Using OS_ID_HPUX will return the equivalent of the 'modelname' command
+ * on HP/UX.
  */
-int pdc_model_sysmodel(char *name)
+int pdc_model_sysmodel(unsigned int os_id, char *name)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         retval = mem_pdc_call(PDC_MODEL, PDC_MODEL_SYSMODEL, __pa(pdc_result),
-                              OS_ID_HPUX, __pa(name));
+                              os_id, __pa(name));
         convert_to_wide(pdc_result);
 
         if (retval == PDC_OK) {
@@ -409,14 +545,14 @@ int pdc_model_sysmodel(char *name)
         } else {
                 name[0] = 0;
         }
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
 
 /**
  * pdc_model_versions - Identify the version number of each processor.
- * @cpu_id: The return buffer.
+ * @versions: The return buffer.
  * @id: The id of the processor to check.
  *
  * Returns the version number for each processor component.
@@ -427,12 +563,13 @@ int pdc_model_sysmodel(char *name)
 int pdc_model_versions(unsigned long *versions, int id)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         retval = mem_pdc_call(PDC_MODEL, PDC_MODEL_VERSIONS, __pa(pdc_result), id);
         convert_to_wide(pdc_result);
         *versions = pdc_result[0];
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
@@ -447,13 +584,14 @@ int pdc_model_versions(unsigned long *versions, int id)
 int pdc_model_cpuid(unsigned long *cpu_id)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         pdc_result[0] = 0; /* preset zero (call may not be implemented!) */
         retval = mem_pdc_call(PDC_MODEL, PDC_MODEL_CPU_ID, __pa(pdc_result), 0);
         convert_to_wide(pdc_result);
         *cpu_id = pdc_result[0];
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
@@ -468,15 +606,44 @@ int pdc_model_cpuid(unsigned long *cpu_id)
 int pdc_model_capabilities(unsigned long *capabilities)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         pdc_result[0] = 0; /* preset zero (call may not be implemented!) */
         retval = mem_pdc_call(PDC_MODEL, PDC_MODEL_CAPABILITIES, __pa(pdc_result), 0);
         convert_to_wide(pdc_result);
-        *capabilities = pdc_result[0];
-        spin_unlock_irq(&pdc_lock);
+        if (retval == PDC_OK) {
+                *capabilities = pdc_result[0];
+        } else {
+                *capabilities = PDC_MODEL_OS32;
+        }
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
+}
+
+/**
+ * pdc_model_platform_info - Returns machine product and serial number.
+ * @orig_prod_num: Return buffer for original product number.
+ * @current_prod_num: Return buffer for current product number.
+ * @serial_no: Return buffer for serial number.
+ *
+ * Returns strings containing the original and current product numbers and the
+ * serial number of the system.
+ */
+int pdc_model_platform_info(char *orig_prod_num, char *current_prod_num,
+		char *serial_no)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_MODEL, PDC_MODEL_GET_PLATFORM_INFO,
+		__pa(orig_prod_num), __pa(current_prod_num), __pa(serial_no));
+	convert_to_wide(pdc_result);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
 }
 
 /**
@@ -488,17 +655,38 @@ int pdc_model_capabilities(unsigned long *capabilities)
 int pdc_cache_info(struct pdc_cache_info *cache_info)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         retval = mem_pdc_call(PDC_CACHE, PDC_CACHE_INFO, __pa(pdc_result), 0);
         convert_to_wide(pdc_result);
         memcpy(cache_info, pdc_result, sizeof(*cache_info));
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
 
-#ifndef CONFIG_PA20
+/**
+ * pdc_spaceid_bits - Return whether Space ID hashing is turned on.
+ * @space_bits: Should be 0, if not, bad mojo!
+ *
+ * Returns information about Space ID hashing.
+ */
+int pdc_spaceid_bits(unsigned long *space_bits)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	pdc_result[0] = 0;
+	retval = mem_pdc_call(PDC_CACHE, PDC_CACHE_RET_SPID, __pa(pdc_result), 0);
+	convert_to_wide(pdc_result);
+	*space_bits = pdc_result[0];
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
 /**
  * pdc_btlb_info - Return block TLB information.
  * @btlb: The return buffer.
@@ -507,17 +695,51 @@ int pdc_cache_info(struct pdc_cache_info *cache_info)
  */
 int pdc_btlb_info(struct pdc_btlb_info *btlb) 
 {
-        int retval;
+	int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
-        retval = mem_pdc_call(PDC_BLOCK_TLB, PDC_BTLB_INFO, __pa(pdc_result), 0);
-        memcpy(btlb, pdc_result, sizeof(*btlb));
-        spin_unlock_irq(&pdc_lock);
+	if (IS_ENABLED(CONFIG_PA20))
+		return PDC_BAD_PROC;
 
-        if(retval < 0) {
-                btlb->max_size = 0;
-        }
-        return retval;
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_BLOCK_TLB, PDC_BTLB_INFO, __pa(pdc_result), 0);
+	memcpy(btlb, pdc_result, sizeof(*btlb));
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	if(retval < 0) {
+		btlb->max_size = 0;
+	}
+	return retval;
+}
+
+int pdc_btlb_insert(unsigned long long vpage, unsigned long physpage, unsigned long len,
+		    unsigned long entry_info, unsigned long slot)
+{
+	int retval;
+	unsigned long flags;
+
+	if (IS_ENABLED(CONFIG_PA20))
+		return PDC_BAD_PROC;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_BLOCK_TLB, PDC_BTLB_INSERT, (unsigned long) (vpage >> 32),
+			      (unsigned long) vpage, physpage, len, entry_info, slot);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+	return retval;
+}
+
+int pdc_btlb_purge_all(void)
+{
+	int retval;
+	unsigned long flags;
+
+	if (IS_ENABLED(CONFIG_PA20))
+		return PDC_BAD_PROC;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_BLOCK_TLB, PDC_BTLB_PURGE_ALL);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+	return retval;
 }
 
 /**
@@ -536,17 +758,20 @@ int pdc_mem_map_hpa(struct pdc_memory_map *address,
 		struct pdc_module_path *mod_path)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+	if (IS_ENABLED(CONFIG_PA20))
+		return PDC_BAD_PROC;
+
+        spin_lock_irqsave(&pdc_lock, flags);
         memcpy(pdc_result2, mod_path, sizeof(*mod_path));
         retval = mem_pdc_call(PDC_MEM_MAP, PDC_MEM_MAP_HPA, __pa(pdc_result),
 				__pa(pdc_result2));
         memcpy(address, pdc_result, sizeof(*address));
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
-#endif	/* !CONFIG_PA20 */
 
 /**
  * pdc_lan_station_id - Get the LAN address.
@@ -558,8 +783,9 @@ int pdc_mem_map_hpa(struct pdc_memory_map *address,
 int pdc_lan_station_id(char *lan_addr, unsigned long hpa)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_LAN_STATION_ID, PDC_LAN_STATION_ID_READ,
 			__pa(pdc_result), hpa);
 	if (retval < 0) {
@@ -568,7 +794,7 @@ int pdc_lan_station_id(char *lan_addr, unsigned long hpa)
 	} else {
 		memcpy(lan_addr, pdc_result, PDC_LAN_STATION_ID_SIZE);
 	}
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -578,7 +804,7 @@ EXPORT_SYMBOL(pdc_lan_station_id);
  * pdc_stable_read - Read data from Stable Storage.
  * @staddr: Stable Storage address to access.
  * @memaddr: The memory address where Stable Storage data shall be copied.
- * @count: number of bytes to transfert. count is multiple of 4.
+ * @count: number of bytes to transfer. count is multiple of 4.
  *
  * This PDC call reads from the Stable Storage address supplied in staddr
  * and copies count bytes to the memory address memaddr.
@@ -587,13 +813,14 @@ EXPORT_SYMBOL(pdc_lan_station_id);
 int pdc_stable_read(unsigned long staddr, void *memaddr, unsigned long count)
 {
        int retval;
+	unsigned long flags;
 
-       spin_lock_irq(&pdc_lock);
+       spin_lock_irqsave(&pdc_lock, flags);
        retval = mem_pdc_call(PDC_STABLE, PDC_STABLE_READ, staddr,
                __pa(pdc_result), count);
        convert_to_wide(pdc_result);
        memcpy(memaddr, pdc_result, count);
-       spin_unlock_irq(&pdc_lock);
+       spin_unlock_irqrestore(&pdc_lock, flags);
 
        return retval;
 }
@@ -603,7 +830,7 @@ EXPORT_SYMBOL(pdc_stable_read);
  * pdc_stable_write - Write data to Stable Storage.
  * @staddr: Stable Storage address to access.
  * @memaddr: The memory address where Stable Storage data shall be read from.
- * @count: number of bytes to transfert. count is multiple of 4.
+ * @count: number of bytes to transfer. count is multiple of 4.
  *
  * This PDC call reads count bytes from the supplied memaddr address,
  * and copies count bytes to the Stable Storage address staddr.
@@ -612,13 +839,14 @@ EXPORT_SYMBOL(pdc_stable_read);
 int pdc_stable_write(unsigned long staddr, void *memaddr, unsigned long count)
 {
        int retval;
+	unsigned long flags;
 
-       spin_lock_irq(&pdc_lock);
+       spin_lock_irqsave(&pdc_lock, flags);
        memcpy(pdc_result, memaddr, count);
        convert_to_wide(pdc_result);
        retval = mem_pdc_call(PDC_STABLE, PDC_STABLE_WRITE, staddr,
                __pa(pdc_result), count);
-       spin_unlock_irq(&pdc_lock);
+       spin_unlock_irqrestore(&pdc_lock, flags);
 
        return retval;
 }
@@ -636,11 +864,12 @@ EXPORT_SYMBOL(pdc_stable_write);
 int pdc_stable_get_size(unsigned long *size)
 {
        int retval;
+	unsigned long flags;
 
-       spin_lock_irq(&pdc_lock);
+       spin_lock_irqsave(&pdc_lock, flags);
        retval = mem_pdc_call(PDC_STABLE, PDC_STABLE_RETURN_SIZE, __pa(pdc_result));
        *size = pdc_result[0];
-       spin_unlock_irq(&pdc_lock);
+       spin_unlock_irqrestore(&pdc_lock, flags);
 
        return retval;
 }
@@ -655,10 +884,11 @@ EXPORT_SYMBOL(pdc_stable_get_size);
 int pdc_stable_verify_contents(void)
 {
        int retval;
+	unsigned long flags;
 
-       spin_lock_irq(&pdc_lock);
+       spin_lock_irqsave(&pdc_lock, flags);
        retval = mem_pdc_call(PDC_STABLE, PDC_STABLE_VERIFY_CONTENTS);
-       spin_unlock_irq(&pdc_lock);
+       spin_unlock_irqrestore(&pdc_lock, flags);
 
        return retval;
 }
@@ -673,10 +903,11 @@ EXPORT_SYMBOL(pdc_stable_verify_contents);
 int pdc_stable_initialize(void)
 {
        int retval;
+	unsigned long flags;
 
-       spin_lock_irq(&pdc_lock);
+       spin_lock_irqsave(&pdc_lock, flags);
        retval = mem_pdc_call(PDC_STABLE, PDC_STABLE_INITIALIZE);
-       spin_unlock_irq(&pdc_lock);
+       spin_unlock_irqrestore(&pdc_lock, flags);
 
        return retval;
 }
@@ -699,8 +930,9 @@ EXPORT_SYMBOL(pdc_stable_initialize);
 int pdc_get_initiator(struct hardware_path *hwpath, struct pdc_initiator *initiator)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 
 /* BCJ-XXXX series boxes. E.G. "9000/785/C3000" */
 #define IS_SPROCKETS() (strlen(boot_cpu_data.pdc.sys_model_name) == 14 && \
@@ -740,7 +972,8 @@ int pdc_get_initiator(struct hardware_path *hwpath, struct pdc_initiator *initia
 	}
 
  out:
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
 	return (retval >= PDC_OK);
 }
 EXPORT_SYMBOL(pdc_get_initiator);
@@ -758,13 +991,14 @@ EXPORT_SYMBOL(pdc_get_initiator);
 int pdc_pci_irt_size(unsigned long *num_entries, unsigned long hpa)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PCI_INDEX, PDC_PCI_GET_INT_TBL_SIZE, 
 			      __pa(pdc_result), hpa);
 	convert_to_wide(pdc_result);
 	*num_entries = pdc_result[0];
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -781,14 +1015,15 @@ int pdc_pci_irt_size(unsigned long *num_entries, unsigned long hpa)
 int pdc_pci_irt(unsigned long num_entries, unsigned long hpa, void *tbl)
 {
 	int retval;
+	unsigned long flags;
 
 	BUG_ON((unsigned long)tbl & 0x7);
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	pdc_result[0] = num_entries;
 	retval = mem_pdc_call(PDC_PCI_INDEX, PDC_PCI_GET_INT_TBL, 
 			      __pa(pdc_result), hpa, __pa(tbl));
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -798,41 +1033,47 @@ int pdc_pci_irt(unsigned long num_entries, unsigned long hpa, void *tbl)
 
 /** 
  * pdc_pci_config_read - read PCI config space.
- * @hpa		token from PDC to indicate which PCI device
- * @pci_addr	configuration space address to read from
+ * @hpa: Token from PDC to indicate which PCI device
+ * @cfg_addr: Configuration space address to read from
  *
  * Read PCI Configuration space *before* linux PCI subsystem is running.
  */
 unsigned int pdc_pci_config_read(void *hpa, unsigned long cfg_addr)
 {
 	int retval;
-	spin_lock_irq(&pdc_lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
 	pdc_result[0] = 0;
 	pdc_result[1] = 0;
 	retval = mem_pdc_call(PDC_PCI_INDEX, PDC_PCI_READ_CONFIG, 
 			      __pa(pdc_result), hpa, cfg_addr&~3UL, 4UL);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
 	return retval ? ~0 : (unsigned int) pdc_result[0];
 }
 
 
 /** 
  * pdc_pci_config_write - read PCI config space.
- * @hpa		token from PDC to indicate which PCI device
- * @pci_addr	configuration space address to write
- * @val		value we want in the 32-bit register
+ * @hpa: Token from PDC to indicate which PCI device
+ * @cfg_addr: Configuration space address to write
+ * @val: Value we want in the 32-bit register
  *
  * Write PCI Configuration space *before* linux PCI subsystem is running.
  */
 void pdc_pci_config_write(void *hpa, unsigned long cfg_addr, unsigned int val)
 {
 	int retval;
-	spin_lock_irq(&pdc_lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
 	pdc_result[0] = 0;
 	retval = mem_pdc_call(PDC_PCI_INDEX, PDC_PCI_WRITE_CONFIG, 
 			      __pa(pdc_result), hpa,
 			      cfg_addr&~3UL, 4UL, (unsigned long) val);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
 	return retval;
 }
 #endif /* UNTESTED CODE */
@@ -846,16 +1087,90 @@ void pdc_pci_config_write(void *hpa, unsigned long cfg_addr, unsigned int val)
 int pdc_tod_read(struct pdc_tod *tod)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         retval = mem_pdc_call(PDC_TOD, PDC_TOD_READ, __pa(pdc_result), 0);
         convert_to_wide(pdc_result);
         memcpy(tod, pdc_result, sizeof(*tod));
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
 EXPORT_SYMBOL(pdc_tod_read);
+
+int pdc_mem_pdt_info(struct pdc_mem_retinfo *rinfo)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_MEM, PDC_MEM_MEMINFO, __pa(pdc_result), 0);
+	convert_to_wide(pdc_result);
+	memcpy(rinfo, pdc_result, sizeof(*rinfo));
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
+int pdc_mem_pdt_read_entries(struct pdc_mem_read_pdt *pret,
+		unsigned long *pdt_entries_ptr)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_MEM, PDC_MEM_READ_PDT, __pa(pdc_result),
+			__pa(pdt_entries_ptr));
+	if (retval == PDC_OK) {
+		convert_to_wide(pdc_result);
+		memcpy(pret, pdc_result, sizeof(*pret));
+	}
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+#ifdef CONFIG_64BIT
+	/*
+	 * 64-bit kernels should not call this PDT function in narrow mode.
+	 * The pdt_entries_ptr array above will now contain 32-bit values
+	 */
+	if (WARN_ON_ONCE((retval == PDC_OK) && parisc_narrow_firmware))
+		return PDC_ERROR;
+#endif
+
+	return retval;
+}
+
+/**
+ * pdc_pim_toc11 - Fetch TOC PIM 1.1 data from firmware.
+ * @ret: pointer to return buffer
+ */
+int pdc_pim_toc11(struct pdc_toc_pim_11 *ret)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PIM, PDC_PIM_TOC, __pa(pdc_result),
+			      __pa(ret), sizeof(*ret));
+	spin_unlock_irqrestore(&pdc_lock, flags);
+	return retval;
+}
+
+/**
+ * pdc_pim_toc20 - Fetch TOC PIM 2.0 data from firmware.
+ * @ret: pointer to return buffer
+ */
+int pdc_pim_toc20(struct pdc_toc_pim_20 *ret)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PIM, PDC_PIM_TOC, __pa(pdc_result),
+			      __pa(ret), sizeof(*ret));
+	spin_unlock_irqrestore(&pdc_lock, flags);
+	return retval;
+}
 
 /**
  * pdc_tod_set - Set the Time-Of-Day clock.
@@ -867,31 +1182,33 @@ EXPORT_SYMBOL(pdc_tod_read);
 int pdc_tod_set(unsigned long sec, unsigned long usec)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         retval = mem_pdc_call(PDC_TOD, PDC_TOD_WRITE, sec, usec);
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
 EXPORT_SYMBOL(pdc_tod_set);
 
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 int pdc_mem_mem_table(struct pdc_memory_table_raddr *r_addr,
 		struct pdc_memory_table *tbl, unsigned long entries)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_MEM, PDC_MEM_TABLE, __pa(pdc_result), __pa(pdc_result2), entries);
 	convert_to_wide(pdc_result);
 	memcpy(r_addr, pdc_result, sizeof(*r_addr));
 	memcpy(tbl, pdc_result2, entries * sizeof(*tbl));
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
-#endif /* __LP64__ */
+#endif /* CONFIG_64BIT */
 
 /* FIXME: Is this pdc used?  I could not find type reference to ftc_bitmap
  * so I guessed at unsigned long.  Someone who knows what this does, can fix
@@ -900,11 +1217,12 @@ int pdc_mem_mem_table(struct pdc_memory_table_raddr *r_addr,
 int pdc_do_firm_test_reset(unsigned long ftc_bitmap)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         retval = mem_pdc_call(PDC_BROADCAST_RESET, PDC_DO_FIRM_TEST_RESET,
                               PDC_FIRM_TEST_MAGIC, ftc_bitmap);
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
@@ -917,10 +1235,11 @@ int pdc_do_firm_test_reset(unsigned long ftc_bitmap)
 int pdc_do_reset(void)
 {
         int retval;
+	unsigned long flags;
 
-        spin_lock_irq(&pdc_lock);
+        spin_lock_irqsave(&pdc_lock, flags);
         retval = mem_pdc_call(PDC_BROADCAST_RESET, PDC_DO_RESET);
-        spin_unlock_irq(&pdc_lock);
+        spin_unlock_irqrestore(&pdc_lock, flags);
 
         return retval;
 }
@@ -934,37 +1253,60 @@ int pdc_do_reset(void)
 int __init pdc_soft_power_info(unsigned long *power_reg)
 {
 	int retval;
+	unsigned long flags;
 
 	*power_reg = (unsigned long) (-1);
 	
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_SOFT_POWER, PDC_SOFT_POWER_INFO, __pa(pdc_result), 0);
 	if (retval == PDC_OK) {
                 convert_to_wide(pdc_result);
                 *power_reg = f_extend(pdc_result[0]);
 	}
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
 
 /*
- * pdc_soft_power_button - Control the soft power button behaviour
- * @sw_control: 0 for hardware control, 1 for software control 
+ * pdc_soft_power_button{_panic} - Control the soft power button behaviour
+ * @sw_control: 0 for hardware control, 1 for software control
  *
  *
  * This PDC function places the soft power button under software or
  * hardware control.
- * Under software control the OS may control to when to allow to shut 
- * down the system. Under hardware control pressing the power button 
+ * Under software control the OS may control to when to allow to shut
+ * down the system. Under hardware control pressing the power button
  * powers off the system immediately.
+ *
+ * The _panic version relies on spin_trylock to prevent deadlock
+ * on panic path.
  */
 int pdc_soft_power_button(int sw_control)
 {
 	int retval;
-	spin_lock_irq(&pdc_lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_SOFT_POWER, PDC_SOFT_POWER_ENABLE, __pa(pdc_result), sw_control);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
+int pdc_soft_power_button_panic(int sw_control)
+{
+	int retval;
+	unsigned long flags;
+
+	if (!spin_trylock_irqsave(&pdc_lock, flags)) {
+		pr_emerg("Couldn't enable soft power button\n");
+		return -EBUSY; /* ignored by the panic notifier */
+	}
+
+	retval = mem_pdc_call(PDC_SOFT_POWER, PDC_SOFT_POWER_ENABLE, __pa(pdc_result), sw_control);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
 	return retval;
 }
 
@@ -975,9 +1317,11 @@ int pdc_soft_power_button(int sw_control)
  */
 void pdc_io_reset(void)
 {
-	spin_lock_irq(&pdc_lock);  
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
 	mem_pdc_call(PDC_IO, PDC_IO_RESET, 0);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 }
 
 /*
@@ -991,84 +1335,62 @@ void pdc_io_reset(void)
  */
 void pdc_io_reset_devices(void)
 {
-	spin_lock_irq(&pdc_lock);  
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
 	mem_pdc_call(PDC_IO, PDC_IO_RESET_DEVICES, 0);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 }
 
+#endif /* defined(BOOTLOADER) */
+
+/* locked by pdc_lock */
+static char iodc_dbuf[4096] __page_aligned_bss;
 
 /**
- * pdc_iodc_putc - Console character print using IODC.
- * @c: the character to output.
+ * pdc_iodc_print - Console print using IODC.
+ * @str: the string to output.
+ * @count: length of str
  *
  * Note that only these special chars are architected for console IODC io:
  * BEL, BS, CR, and LF. Others are passed through.
  * Since the HP console requires CR+LF to perform a 'newline', we translate
  * "\n" to "\r\n".
  */
-void pdc_iodc_putc(unsigned char c)
+int pdc_iodc_print(const unsigned char *str, unsigned count)
 {
-        /* XXX Should we spinlock posx usage */
-        static int posx;        /* for simple TAB-Simulation... */
-        static int __attribute__((aligned(8)))   iodc_retbuf[32];
-        static char __attribute__((aligned(64))) iodc_dbuf[4096];
-        unsigned int n;
-	unsigned int flags;
+	unsigned int i, found = 0;
+	unsigned long flags;
 
-        switch (c) {
-        case '\n':
-                iodc_dbuf[0] = '\r';
-                iodc_dbuf[1] = '\n';
-                n = 2;
-                posx = 0;
-                break;
-        case '\t':
-                pdc_iodc_putc(' ');
-                while (posx & 7)        /* expand TAB */
-                        pdc_iodc_putc(' ');
-                return;         /* return since IODC can't handle this */
-        case '\b':
-                posx-=2;                /* BS */
-        default:
-                iodc_dbuf[0] = c;
-                n = 1;
-                posx++;
-                break;
-        }
-
-        spin_lock_irqsave(&pdc_lock, flags);
-        real32_call(PAGE0->mem_cons.iodc_io,
-                    (unsigned long)PAGE0->mem_cons.hpa, ENTRY_IO_COUT,
-                    PAGE0->mem_cons.spa, __pa(PAGE0->mem_cons.dp.layers),
-                    __pa(iodc_retbuf), 0, __pa(iodc_dbuf), n, 0);
-        spin_unlock_irqrestore(&pdc_lock, flags);
-}
-
-/**
- * pdc_iodc_outc - Console character print using IODC (without conversions).
- * @c: the character to output.
- *
- * Write the character directly to the IODC console.
- */
-void pdc_iodc_outc(unsigned char c)
-{
-	unsigned int n, flags;
-
-	/* fill buffer with one caracter and print it */
-        static int __attribute__((aligned(8)))   iodc_retbuf[32];
-        static char __attribute__((aligned(64))) iodc_dbuf[4096];
-
-	n = 1;
-	iodc_dbuf[0] = c;
+	count = min_t(unsigned int, count, sizeof(iodc_dbuf));
 
 	spin_lock_irqsave(&pdc_lock, flags);
+	for (i = 0; i < count;) {
+		switch(str[i]) {
+		case '\n':
+			iodc_dbuf[i+0] = '\r';
+			iodc_dbuf[i+1] = '\n';
+			i += 2;
+			found = 1;
+			goto print;
+		default:
+			iodc_dbuf[i] = str[i];
+			i++;
+			break;
+		}
+	}
+
+print:
 	real32_call(PAGE0->mem_cons.iodc_io,
-		    (unsigned long)PAGE0->mem_cons.hpa, ENTRY_IO_COUT,
-		    PAGE0->mem_cons.spa, __pa(PAGE0->mem_cons.dp.layers),
-		    __pa(iodc_retbuf), 0, __pa(iodc_dbuf), n, 0);
+		(unsigned long)PAGE0->mem_cons.hpa, ENTRY_IO_COUT,
+		PAGE0->mem_cons.spa, __pa(PAGE0->mem_cons.dp.layers),
+		__pa(pdc_result), 0, __pa(iodc_dbuf), i, 0);
 	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return i - found;
 }
 
+#if !defined(BOOTLOADER)
 /**
  * pdc_iodc_getc - Read a character (non-blocking) from the PDC console.
  *
@@ -1077,11 +1399,9 @@ void pdc_iodc_outc(unsigned char c)
  */
 int pdc_iodc_getc(void)
 {
-	unsigned int flags;
-        static int __attribute__((aligned(8)))   iodc_retbuf[32];
-        static char __attribute__((aligned(64))) iodc_dbuf[4096];
 	int ch;
 	int status;
+	unsigned long flags;
 
 	/* Bail if no console input device. */
 	if (!PAGE0->mem_kbd.iodc_io)
@@ -1092,10 +1412,11 @@ int pdc_iodc_getc(void)
 	real32_call(PAGE0->mem_kbd.iodc_io,
 		    (unsigned long)PAGE0->mem_kbd.hpa, ENTRY_IO_CIN,
 		    PAGE0->mem_kbd.spa, __pa(PAGE0->mem_kbd.dp.layers), 
-		    __pa(iodc_retbuf), 0, __pa(iodc_dbuf), 1, 0);
+		    __pa(pdc_result), 0, __pa(iodc_dbuf), 1, 0);
 
 	ch = *iodc_dbuf;
-	status = *iodc_retbuf;
+	/* like convert_to_wide() but for first return value only: */
+	status = *(int *)&pdc_result;
 	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	if (status == 0)
@@ -1105,20 +1426,29 @@ int pdc_iodc_getc(void)
 }
 
 int pdc_sti_call(unsigned long func, unsigned long flags,
-                 unsigned long inptr, unsigned long outputr,
-                 unsigned long glob_cfg)
+		unsigned long inptr, unsigned long outputr,
+		unsigned long glob_cfg, int do_call64)
 {
-        int retval;
+	int retval = 0;
+	unsigned long irqflags;
 
-        spin_lock_irq(&pdc_lock);  
-        retval = real32_call(func, flags, inptr, outputr, glob_cfg);
-        spin_unlock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, irqflags);
+	if (IS_ENABLED(CONFIG_64BIT) && do_call64) {
+#ifdef CONFIG_64BIT
+		retval = real64_call(func, flags, inptr, outputr, glob_cfg);
+#else
+		WARN_ON(1);
+#endif
+	} else {
+		retval = real32_call(func, flags, inptr, outputr, glob_cfg);
+	}
+	spin_unlock_irqrestore(&pdc_lock, irqflags);
 
-        return retval;
+	return retval;
 }
 EXPORT_SYMBOL(pdc_sti_call);
 
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 /**
  * pdc_pat_cell_get_number - Returns the cell number.
  * @cell_info: The return buffer.
@@ -1129,11 +1459,12 @@ EXPORT_SYMBOL(pdc_sti_call);
 int pdc_pat_cell_get_number(struct pdc_pat_cell_num *cell_info)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_CELL, PDC_PAT_CELL_GET_NUMBER, __pa(pdc_result));
 	memcpy(cell_info, pdc_result, sizeof(*cell_info));
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -1153,16 +1484,47 @@ int pdc_pat_cell_module(unsigned long *actcnt, unsigned long ploc, unsigned long
 			unsigned long view_type, void *mem_addr)
 {
 	int retval;
+	unsigned long flags;
 	static struct pdc_pat_cell_mod_maddr_block result __attribute__ ((aligned (8)));
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_CELL, PDC_PAT_CELL_MODULE, __pa(pdc_result), 
 			      ploc, mod, view_type, __pa(&result));
 	if(!retval) {
 		*actcnt = pdc_result[0];
 		memcpy(mem_addr, &result, *actcnt);
 	}
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
+/**
+ * pdc_pat_cell_info - Retrieve the cell's information.
+ * @info: The pointer to a struct pdc_pat_cell_info_rtn_block.
+ * @actcnt: The number of bytes which should be written to info.
+ * @offset: offset of the structure.
+ * @cell_number: The cell number which should be asked, or -1 for current cell.
+ *
+ * This PDC call returns information about the given cell (or all cells).
+ */
+int pdc_pat_cell_info(struct pdc_pat_cell_info_rtn_block *info,
+		unsigned long *actcnt, unsigned long offset,
+		unsigned long cell_number)
+{
+	int retval;
+	unsigned long flags;
+	struct pdc_pat_cell_info_rtn_block result;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PAT_CELL, PDC_PAT_CELL_GET_INFO,
+			__pa(pdc_result), __pa(&result), *actcnt,
+			offset, cell_number);
+	if (!retval) {
+		*actcnt = pdc_result[0];
+		memcpy(info, &result, *actcnt);
+	}
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -1174,15 +1536,16 @@ int pdc_pat_cell_module(unsigned long *actcnt, unsigned long ploc, unsigned long
  *
  * Retrieve the cpu number for the cpu at the specified HPA.
  */
-int pdc_pat_cpu_get_number(struct pdc_pat_cpu_num *cpu_info, void *hpa)
+int pdc_pat_cpu_get_number(struct pdc_pat_cpu_num *cpu_info, unsigned long hpa)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_CPU, PDC_PAT_CPU_GET_NUMBER,
 			      __pa(&pdc_result), hpa);
 	memcpy(cpu_info, pdc_result, sizeof(*cpu_info));
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -1198,12 +1561,13 @@ int pdc_pat_cpu_get_number(struct pdc_pat_cpu_num *cpu_info, void *hpa)
 int pdc_pat_get_irt_size(unsigned long *num_entries, unsigned long cell_num)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_IO, PDC_PAT_IO_GET_PCI_ROUTING_TABLE_SIZE,
 			      __pa(pdc_result), cell_num);
 	*num_entries = pdc_result[0];
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -1218,18 +1582,19 @@ int pdc_pat_get_irt_size(unsigned long *num_entries, unsigned long cell_num)
 int pdc_pat_get_irt(void *r_addr, unsigned long cell_num)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_IO, PDC_PAT_IO_GET_PCI_ROUTING_TABLE,
 			      __pa(r_addr), cell_num);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
 
 /**
  * pdc_pat_pd_get_addr_map - Retrieve information about memory address ranges.
- * @actlen: The return buffer.
+ * @actual_len: The return buffer.
  * @mem_addr: Pointer to the memory buffer.
  * @count: The number of bytes to read from the buffer.
  * @offset: The offset with respect to the beginning of the buffer.
@@ -1239,16 +1604,44 @@ int pdc_pat_pd_get_addr_map(unsigned long *actual_len, void *mem_addr,
 			    unsigned long count, unsigned long offset)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_PD, PDC_PAT_PD_GET_ADDR_MAP, __pa(pdc_result), 
 			      __pa(pdc_result2), count, offset);
 	*actual_len = pdc_result[0];
 	memcpy(mem_addr, pdc_result2, *actual_len);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
+
+/**
+ * pdc_pat_pd_get_pdc_revisions - Retrieve PDC interface revisions.
+ * @legacy_rev: The legacy revision.
+ * @pat_rev: The PAT revision.
+ * @pdc_cap: The PDC capabilities.
+ *
+ */
+int pdc_pat_pd_get_pdc_revisions(unsigned long *legacy_rev,
+		unsigned long *pat_rev, unsigned long *pdc_cap)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PAT_PD, PDC_PAT_PD_GET_PDC_INTERF_REV,
+				__pa(pdc_result));
+	if (retval == PDC_OK) {
+		*legacy_rev = pdc_result[0];
+		*pat_rev = pdc_result[1];
+		*pdc_cap = pdc_result[2];
+	}
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
 
 /**
  * pdc_pat_io_pci_cfg_read - Read PCI configuration space.
@@ -1260,15 +1653,17 @@ int pdc_pat_pd_get_addr_map(unsigned long *actual_len, void *mem_addr,
 int pdc_pat_io_pci_cfg_read(unsigned long pci_addr, int pci_size, u32 *mem_addr)
 {
 	int retval;
-	spin_lock_irq(&pdc_lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_IO, PDC_PAT_IO_PCI_CONFIG_READ,
 					__pa(pdc_result), pci_addr, pci_size);
 	switch(pci_size) {
-		case 1: *(u8 *) mem_addr =  (u8)  pdc_result[0];
-		case 2: *(u16 *)mem_addr =  (u16) pdc_result[0];
-		case 4: *(u32 *)mem_addr =  (u32) pdc_result[0];
+		case 1: *(u8 *) mem_addr =  (u8)  pdc_result[0]; break;
+		case 2: *(u16 *)mem_addr =  (u16) pdc_result[0]; break;
+		case 4: *(u32 *)mem_addr =  (u32) pdc_result[0]; break;
 	}
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
@@ -1277,22 +1672,154 @@ int pdc_pat_io_pci_cfg_read(unsigned long pci_addr, int pci_size, u32 *mem_addr)
  * pdc_pat_io_pci_cfg_write - Retrieve information about memory address ranges.
  * @pci_addr: PCI configuration space address for which the write  request is being made.
  * @pci_size: Size of write in bytes. Valid values are 1, 2, and 4. 
- * @value: Pointer to 1, 2, or 4 byte value in low order end of argument to be 
+ * @val: Pointer to 1, 2, or 4 byte value in low order end of argument to be
  *         written to PCI Config space.
  *
  */
 int pdc_pat_io_pci_cfg_write(unsigned long pci_addr, int pci_size, u32 val)
 {
 	int retval;
+	unsigned long flags;
 
-	spin_lock_irq(&pdc_lock);
+	spin_lock_irqsave(&pdc_lock, flags);
 	retval = mem_pdc_call(PDC_PAT_IO, PDC_PAT_IO_PCI_CONFIG_WRITE,
 				pci_addr, pci_size, val);
-	spin_unlock_irq(&pdc_lock);
+	spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return retval;
 }
-#endif /* __LP64__ */
+
+/**
+ * pdc_pat_mem_pdt_info - Retrieve information about page deallocation table
+ * @rinfo: memory pdt information
+ *
+ */
+int pdc_pat_mem_pdt_info(struct pdc_pat_mem_retinfo *rinfo)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PAT_MEM, PDC_PAT_MEM_PD_INFO,
+			__pa(&pdc_result));
+	if (retval == PDC_OK)
+		memcpy(rinfo, &pdc_result, sizeof(*rinfo));
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
+/**
+ * pdc_pat_mem_pdt_cell_info - Retrieve information about page deallocation
+ *				table of a cell
+ * @rinfo: memory pdt information
+ * @cell: cell number
+ *
+ */
+int pdc_pat_mem_pdt_cell_info(struct pdc_pat_mem_cell_pdt_retinfo *rinfo,
+		unsigned long cell)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PAT_MEM, PDC_PAT_MEM_CELL_INFO,
+			__pa(&pdc_result), cell);
+	if (retval == PDC_OK)
+		memcpy(rinfo, &pdc_result, sizeof(*rinfo));
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
+/**
+ * pdc_pat_mem_read_cell_pdt - Read PDT entries from (old) PAT firmware
+ * @pret: array of PDT entries
+ * @pdt_entries_ptr: ptr to hold number of PDT entries
+ * @max_entries: maximum number of entries to be read
+ *
+ */
+int pdc_pat_mem_read_cell_pdt(struct pdc_pat_mem_read_pd_retinfo *pret,
+		unsigned long *pdt_entries_ptr, unsigned long max_entries)
+{
+	int retval;
+	unsigned long flags, entries;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	/* PDC_PAT_MEM_CELL_READ is available on early PAT machines only */
+	retval = mem_pdc_call(PDC_PAT_MEM, PDC_PAT_MEM_CELL_READ,
+			__pa(&pdc_result), parisc_cell_num,
+			__pa(pdt_entries_ptr));
+
+	if (retval == PDC_OK) {
+		/* build up return value as for PDC_PAT_MEM_PD_READ */
+		entries = min(pdc_result[0], max_entries);
+		pret->pdt_entries = entries;
+		pret->actual_count_bytes = entries * sizeof(unsigned long);
+	}
+
+	spin_unlock_irqrestore(&pdc_lock, flags);
+	WARN_ON(retval == PDC_OK && pdc_result[0] > max_entries);
+
+	return retval;
+}
+/**
+ * pdc_pat_mem_read_pd_pdt - Read PDT entries from (newer) PAT firmware
+ * @pret: array of PDT entries
+ * @pdt_entries_ptr: ptr to hold number of PDT entries
+ * @count: number of bytes to read
+ * @offset: offset to start (in bytes)
+ *
+ */
+int pdc_pat_mem_read_pd_pdt(struct pdc_pat_mem_read_pd_retinfo *pret,
+		unsigned long *pdt_entries_ptr, unsigned long count,
+		unsigned long offset)
+{
+	int retval;
+	unsigned long flags, entries;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PAT_MEM, PDC_PAT_MEM_PD_READ,
+		__pa(&pdc_result), __pa(pdt_entries_ptr),
+		count, offset);
+
+	if (retval == PDC_OK) {
+		entries = min(pdc_result[0], count);
+		pret->actual_count_bytes = entries;
+		pret->pdt_entries = entries / sizeof(unsigned long);
+	}
+
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+
+/**
+ * pdc_pat_mem_get_dimm_phys_location - Get physical DIMM slot via PAT firmware
+ * @pret: ptr to hold returned information
+ * @phys_addr: physical address to examine
+ *
+ */
+int pdc_pat_mem_get_dimm_phys_location(
+		struct pdc_pat_mem_phys_mem_location *pret,
+		unsigned long phys_addr)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdc_lock, flags);
+	retval = mem_pdc_call(PDC_PAT_MEM, PDC_PAT_MEM_ADDRESS,
+		__pa(&pdc_result), phys_addr);
+
+	if (retval == PDC_OK)
+		memcpy(pret, &pdc_result, sizeof(*pret));
+
+	spin_unlock_irqrestore(&pdc_lock, flags);
+
+	return retval;
+}
+#endif /* CONFIG_64BIT */
+#endif /* defined(BOOTLOADER) */
 
 
 /***************** 32-bit real-mode calls ***********/
@@ -1350,7 +1877,7 @@ long real32_call(unsigned long fn, ...)
 	return real32_call_asm(&real_stack.sp, &real_stack.arg0, fn);
 }
 
-#ifdef __LP64__
+#ifdef CONFIG_64BIT
 /***************** 64-bit real-mode calls ***********/
 
 struct wide_stack {
@@ -1401,5 +1928,4 @@ long real64_call(unsigned long fn, ...)
 	return real64_call_asm(&real64_stack.sp, &real64_stack.arg0, fn);
 }
 
-#endif /* __LP64__ */
-
+#endif /* CONFIG_64BIT */

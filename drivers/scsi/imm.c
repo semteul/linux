@@ -1,23 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /* imm.c   --  low level driver for the IOMEGA MatchMaker
  * parallel port SCSI host adapter.
  * 
  * (The IMM is the embedded controller in the ZIP Plus drive.)
  * 
- * Current Maintainer: David Campbell (Perth, Western Australia)
- *                     campbell@torque.net
- *
- * My unoffical company acronym list is 21 pages long:
+ * My unofficial company acronym list is 21 pages long:
  *      FLA:    Four letter acronym with built in facility for
  *              future expansion to five letters.
  */
 
-#include <linux/config.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/blkdev.h>
 #include <linux/parport.h>
 #include <linux/workqueue.h>
+#include <linux/delay.h>
+#include <linux/slab.h>
 #include <asm/io.h>
 
 #include <scsi/scsi.h>
@@ -39,21 +38,27 @@ typedef struct {
 	int base_hi;		/* Hi Base address for ECP-ISA chipset */
 	int mode;		/* Transfer mode                */
 	struct scsi_cmnd *cur_cmd;	/* Current queued command       */
-	struct work_struct imm_tq;	/* Polling interrupt stuff       */
+	struct delayed_work imm_tq;	/* Polling interrupt stuff       */
 	unsigned long jstart;	/* Jiffies at start             */
 	unsigned failed:1;	/* Failure flag                 */
 	unsigned dp:1;		/* Data phase present           */
 	unsigned rd:1;		/* Read data in data phase      */
 	unsigned wanted:1;	/* Parport sharing busy flag    */
+	unsigned int dev_no;	/* Device number		*/
 	wait_queue_head_t *waiting;
 	struct Scsi_Host *host;
 	struct list_head list;
 } imm_struct;
 
 static void imm_reset_pulse(unsigned int base);
-static int device_check(imm_struct *dev);
+static int device_check(imm_struct *dev, bool autodetect);
 
 #include "imm.h"
+
+static unsigned int mode = IMM_AUTODETECT;
+module_param(mode, uint, 0644);
+MODULE_PARM_DESC(mode, "Transfer mode (0 = Autodetect, 1 = SPP 4-bit, "
+	"2 = SPP 8-bit, 3 = EPP 8-bit, 4 = EPP 16-bit, 5 = EPP 32-bit");
 
 static inline imm_struct *imm_dev(struct Scsi_Host *host)
 {
@@ -66,7 +71,7 @@ static void got_it(imm_struct *dev)
 {
 	dev->base = dev->dev->port->base;
 	if (dev->cur_cmd)
-		dev->cur_cmd->SCp.phase = 1;
+		imm_scsi_pointer(dev->cur_cmd)->phase = 1;
 	else
 		wake_up(dev->waiting);
 }
@@ -78,9 +83,10 @@ static void imm_wakeup(void *ref)
 
 	spin_lock_irqsave(&arbitration_lock, flags);
 	if (dev->wanted) {
-		parport_claim(dev->dev);
-		got_it(dev);
-		dev->wanted = 0;
+		if (parport_claim(dev->dev) == 0) {
+			got_it(dev);
+			dev->wanted = 0;
+		}
 	}
 	spin_unlock_irqrestore(&arbitration_lock, flags);
 }
@@ -123,50 +129,31 @@ static inline void imm_pb_release(imm_struct *dev)
  * testing...
  * Also gives a method to use a script to obtain optimum timings (TODO)
  */
-static inline int imm_proc_write(imm_struct *dev, char *buffer, int length)
+static int imm_write_info(struct Scsi_Host *host, char *buffer, int length)
 {
-	unsigned long x;
+	imm_struct *dev = imm_dev(host);
 
 	if ((length > 5) && (strncmp(buffer, "mode=", 5) == 0)) {
-		x = simple_strtoul(buffer + 5, NULL, 0);
-		dev->mode = x;
+		dev->mode = simple_strtoul(buffer + 5, NULL, 0);
 		return length;
 	}
 	printk("imm /proc: invalid variable\n");
-	return (-EINVAL);
+	return -EINVAL;
 }
 
-static int imm_proc_info(struct Scsi_Host *host, char *buffer, char **start,
-			off_t offset, int length, int inout)
+static int imm_show_info(struct seq_file *m, struct Scsi_Host *host)
 {
 	imm_struct *dev = imm_dev(host);
-	int len = 0;
 
-	if (inout)
-		return imm_proc_write(dev, buffer, length);
-
-	len += sprintf(buffer + len, "Version : %s\n", IMM_VERSION);
-	len +=
-	    sprintf(buffer + len, "Parport : %s\n",
-		    dev->dev->port->name);
-	len +=
-	    sprintf(buffer + len, "Mode    : %s\n",
-		    IMM_MODE_STRING[dev->mode]);
-
-	/* Request for beyond end of buffer */
-	if (offset > len)
-		return 0;
-
-	*start = buffer + offset;
-	len -= offset;
-	if (len > length)
-		len = length;
-	return len;
+	seq_printf(m, "Version : %s\n", IMM_VERSION);
+	seq_printf(m, "Parport : %s\n", dev->dev->port->name);
+	seq_printf(m, "Mode    : %s\n", IMM_MODE_STRING[dev->mode]);
+	return 0;
 }
 
 #if IMM_DEBUG > 0
 #define imm_fail(x,y) printk("imm: imm_fail(%i) from %s at line %d\n",\
-	   y, __FUNCTION__, __LINE__); imm_fail_func(x,y);
+	   y, __func__, __LINE__); imm_fail_func(x,y);
 static inline void
 imm_fail_func(imm_struct *dev, int error_code)
 #else
@@ -384,13 +371,10 @@ static int imm_out(imm_struct *dev, char *buffer, int len)
 	case IMM_EPP_8:
 		epp_reset(ppb);
 		w_ctr(ppb, 0x4);
-#ifdef CONFIG_SCSI_IZIP_EPP16
-		if (!(((long) buffer | len) & 0x01))
-			outsw(ppb + 4, buffer, len >> 1);
-#else
-		if (!(((long) buffer | len) & 0x03))
+		if (dev->mode == IMM_EPP_32 && !(((long) buffer | len) & 0x03))
 			outsl(ppb + 4, buffer, len >> 2);
-#endif
+		else if (dev->mode == IMM_EPP_16 && !(((long) buffer | len) & 0x01))
+			outsw(ppb + 4, buffer, len >> 1);
 		else
 			outsb(ppb + 4, buffer, len);
 		w_ctr(ppb, 0xc);
@@ -444,13 +428,10 @@ static int imm_in(imm_struct *dev, char *buffer, int len)
 	case IMM_EPP_8:
 		epp_reset(ppb);
 		w_ctr(ppb, 0x24);
-#ifdef CONFIG_SCSI_IZIP_EPP16
-		if (!(((long) buffer | len) & 0x01))
-			insw(ppb + 4, buffer, len >> 1);
-#else
-		if (!(((long) buffer | len) & 0x03))
-			insl(ppb + 4, buffer, len >> 2);
-#endif
+		if (dev->mode == IMM_EPP_32 && !(((long) buffer | len) & 0x03))
+			insw(ppb + 4, buffer, len >> 2);
+		else if (dev->mode == IMM_EPP_16 && !(((long) buffer | len) & 0x01))
+			insl(ppb + 4, buffer, len >> 1);
 		else
 			insb(ppb + 4, buffer, len);
 		w_ctr(ppb, 0x2c);
@@ -607,13 +588,28 @@ static int imm_select(imm_struct *dev, int target)
 
 static int imm_init(imm_struct *dev)
 {
+	bool autodetect = dev->mode == IMM_AUTODETECT;
+
+	if (autodetect) {
+		int modes = dev->dev->port->modes;
+
+		/* Mode detection works up the chain of speed
+		 * This avoids a nasty if-then-else-if-... tree
+		 */
+		dev->mode = IMM_NIBBLE;
+
+		if (modes & PARPORT_MODE_TRISTATE)
+			dev->mode = IMM_PS2;
+	}
+
 	if (imm_connect(dev, 0) != 1)
 		return -EIO;
 	imm_reset_pulse(dev->base);
-	udelay(1000);	/* Delay to allow devices to settle */
+	mdelay(1);	/* Delay to allow devices to settle */
 	imm_disconnect(dev);
-	udelay(1000);	/* Another delay to allow devices to settle */
-	return device_check(dev);
+	mdelay(1);	/* Another delay to allow devices to settle */
+
+	return device_check(dev, autodetect);
 }
 
 static inline int imm_send_command(struct scsi_cmnd *cmd)
@@ -636,13 +632,14 @@ static inline int imm_send_command(struct scsi_cmnd *cmd)
  * The driver appears to remain stable if we speed up the parallel port
  * i/o in this function, but not elsewhere.
  */
-static int imm_completion(struct scsi_cmnd *cmd)
+static int imm_completion(struct scsi_cmnd *const cmd)
 {
 	/* Return codes:
 	 * -1     Error
 	 *  0     Told to schedule
 	 *  1     Finished data transfer
 	 */
+	struct scsi_pointer *scsi_pointer = imm_scsi_pointer(cmd);
 	imm_struct *dev = imm_dev(cmd->device->host);
 	unsigned short ppb = dev->base;
 	unsigned long start_jiffies = jiffies;
@@ -678,46 +675,43 @@ static int imm_completion(struct scsi_cmnd *cmd)
 		 * a) Drive status is screwy (!ready && !present)
 		 * b) Drive is requesting/sending more data than expected
 		 */
-		if (((r & 0x88) != 0x88) || (cmd->SCp.this_residual <= 0)) {
+		if ((r & 0x88) != 0x88 || scsi_pointer->this_residual <= 0) {
 			imm_fail(dev, DID_ERROR);
 			return -1;	/* ERROR_RETURN */
 		}
 		/* determine if we should use burst I/O */
 		if (dev->rd == 0) {
-			fast = (bulk
-				&& (cmd->SCp.this_residual >=
-				    IMM_BURST_SIZE)) ? IMM_BURST_SIZE : 2;
-			status = imm_out(dev, cmd->SCp.ptr, fast);
+			fast = bulk && scsi_pointer->this_residual >=
+				IMM_BURST_SIZE ? IMM_BURST_SIZE : 2;
+			status = imm_out(dev, scsi_pointer->ptr, fast);
 		} else {
-			fast = (bulk
-				&& (cmd->SCp.this_residual >=
-				    IMM_BURST_SIZE)) ? IMM_BURST_SIZE : 1;
-			status = imm_in(dev, cmd->SCp.ptr, fast);
+			fast = bulk && scsi_pointer->this_residual >=
+				IMM_BURST_SIZE ? IMM_BURST_SIZE : 1;
+			status = imm_in(dev, scsi_pointer->ptr, fast);
 		}
 
-		cmd->SCp.ptr += fast;
-		cmd->SCp.this_residual -= fast;
+		scsi_pointer->ptr += fast;
+		scsi_pointer->this_residual -= fast;
 
 		if (!status) {
 			imm_fail(dev, DID_BUS_BUSY);
 			return -1;	/* ERROR_RETURN */
 		}
-		if (cmd->SCp.buffer && !cmd->SCp.this_residual) {
+		if (scsi_pointer->buffer && !scsi_pointer->this_residual) {
 			/* if scatter/gather, advance to the next segment */
-			if (cmd->SCp.buffers_residual--) {
-				cmd->SCp.buffer++;
-				cmd->SCp.this_residual =
-				    cmd->SCp.buffer->length;
-				cmd->SCp.ptr =
-				    page_address(cmd->SCp.buffer->page) +
-				    cmd->SCp.buffer->offset;
+			if (scsi_pointer->buffers_residual--) {
+				scsi_pointer->buffer =
+					sg_next(scsi_pointer->buffer);
+				scsi_pointer->this_residual =
+				    scsi_pointer->buffer->length;
+				scsi_pointer->ptr = sg_virt(scsi_pointer->buffer);
 
 				/*
 				 * Make sure that we transfer even number of bytes
 				 * otherwise it makes imm_byte_out() messy.
 				 */
-				if (cmd->SCp.this_residual & 0x01)
-					cmd->SCp.this_residual++;
+				if (scsi_pointer->this_residual & 0x01)
+					scsi_pointer->this_residual++;
 			}
 		}
 		/* Now check to see if the drive is ready to comunicate */
@@ -736,19 +730,14 @@ static int imm_completion(struct scsi_cmnd *cmd)
  * the scheduler's task queue to generate a stream of call-backs and
  * complete the request when the drive is ready.
  */
-static void imm_interrupt(void *data)
+static void imm_interrupt(struct work_struct *work)
 {
-	imm_struct *dev = (imm_struct *) data;
+	imm_struct *dev = container_of(work, imm_struct, imm_tq.work);
 	struct scsi_cmnd *cmd = dev->cur_cmd;
 	struct Scsi_Host *host = cmd->device->host;
 	unsigned long flags;
 
-	if (!cmd) {
-		printk("IMM: bug in imm_interrupt\n");
-		return;
-	}
 	if (imm_engine(dev, cmd)) {
-		INIT_WORK(&dev->imm_tq, imm_interrupt, (void *) dev);
 		schedule_delayed_work(&dev->imm_tq, 1);
 		return;
 	}
@@ -787,20 +776,21 @@ static void imm_interrupt(void *data)
 	}
 #endif
 
-	if (cmd->SCp.phase > 1)
+	if (imm_scsi_pointer(cmd)->phase > 1)
 		imm_disconnect(dev);
 
 	imm_pb_dismiss(dev);
 
 	spin_lock_irqsave(host->host_lock, flags);
 	dev->cur_cmd = NULL;
-	cmd->scsi_done(cmd);
+	scsi_done(cmd);
 	spin_unlock_irqrestore(host->host_lock, flags);
 	return;
 }
 
-static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
+static int imm_engine(imm_struct *dev, struct scsi_cmnd *const cmd)
 {
+	struct scsi_pointer *scsi_pointer = imm_scsi_pointer(cmd);
 	unsigned short ppb = dev->base;
 	unsigned char l = 0, h = 0;
 	int retv, x;
@@ -811,7 +801,7 @@ static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
 	if (dev->failed)
 		return 0;
 
-	switch (cmd->SCp.phase) {
+	switch (scsi_pointer->phase) {
 	case 0:		/* Phase 0 - Waiting for parport */
 		if (time_after(jiffies, dev->jstart + HZ)) {
 			/*
@@ -822,51 +812,47 @@ static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
 			return 0;
 		}
 		return 1;	/* wait until imm_wakeup claims parport */
-		/* Phase 1 - Connected */
-	case 1:
-		imm_connect(dev, CONNECT_EPP_MAYBE);
-		cmd->SCp.phase++;
 
-		/* Phase 2 - We are now talking to the scsi bus */
-	case 2:
-		if (!imm_select(dev, cmd->device->id)) {
+	case 1:		/* Phase 1 - Connected */
+		imm_connect(dev, CONNECT_EPP_MAYBE);
+		scsi_pointer->phase++;
+		fallthrough;
+
+	case 2:		/* Phase 2 - We are now talking to the scsi bus */
+		if (!imm_select(dev, scmd_id(cmd))) {
 			imm_fail(dev, DID_NO_CONNECT);
 			return 0;
 		}
-		cmd->SCp.phase++;
+		scsi_pointer->phase++;
+		fallthrough;
 
-		/* Phase 3 - Ready to accept a command */
-	case 3:
+	case 3:		/* Phase 3 - Ready to accept a command */
 		w_ctr(ppb, 0x0c);
 		if (!(r_str(ppb) & 0x80))
 			return 1;
 
 		if (!imm_send_command(cmd))
 			return 0;
-		cmd->SCp.phase++;
+		scsi_pointer->phase++;
+		fallthrough;
 
-		/* Phase 4 - Setup scatter/gather buffers */
-	case 4:
-		if (cmd->use_sg) {
-			/* if many buffers are available, start filling the first */
-			cmd->SCp.buffer =
-			    (struct scatterlist *) cmd->request_buffer;
-			cmd->SCp.this_residual = cmd->SCp.buffer->length;
-			cmd->SCp.ptr =
-			    page_address(cmd->SCp.buffer->page) +
-			    cmd->SCp.buffer->offset;
+	case 4:		/* Phase 4 - Setup scatter/gather buffers */
+		if (scsi_bufflen(cmd)) {
+			scsi_pointer->buffer = scsi_sglist(cmd);
+			scsi_pointer->this_residual = scsi_pointer->buffer->length;
+			scsi_pointer->ptr = sg_virt(scsi_pointer->buffer);
 		} else {
-			/* else fill the only available buffer */
-			cmd->SCp.buffer = NULL;
-			cmd->SCp.this_residual = cmd->request_bufflen;
-			cmd->SCp.ptr = cmd->request_buffer;
+			scsi_pointer->buffer = NULL;
+			scsi_pointer->this_residual = 0;
+			scsi_pointer->ptr = NULL;
 		}
-		cmd->SCp.buffers_residual = cmd->use_sg - 1;
-		cmd->SCp.phase++;
-		if (cmd->SCp.this_residual & 0x01)
-			cmd->SCp.this_residual++;
-		/* Phase 5 - Pre-Data transfer stage */
-	case 5:
+		scsi_pointer->buffers_residual = scsi_sg_count(cmd) - 1;
+		scsi_pointer->phase++;
+		if (scsi_pointer->this_residual & 0x01)
+			scsi_pointer->this_residual++;
+		fallthrough;
+
+	case 5:		/* Phase 5 - Pre-Data transfer stage */
 		/* Spin lock for BUSY */
 		w_ctr(ppb, 0x0c);
 		if (!(r_str(ppb) & 0x80))
@@ -880,10 +866,10 @@ static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
 		if ((dev->dp) && (dev->rd))
 			if (imm_negotiate(dev))
 				return 0;
-		cmd->SCp.phase++;
+		scsi_pointer->phase++;
+		fallthrough;
 
-		/* Phase 6 - Data transfer stage */
-	case 6:
+	case 6:		/* Phase 6 - Data transfer stage */
 		/* Spin lock for BUSY */
 		w_ctr(ppb, 0x0c);
 		if (!(r_str(ppb) & 0x80))
@@ -896,10 +882,10 @@ static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
 			if (retv == 0)
 				return 1;
 		}
-		cmd->SCp.phase++;
+		scsi_pointer->phase++;
+		fallthrough;
 
-		/* Phase 7 - Post data transfer stage */
-	case 7:
+	case 7:		/* Phase 7 - Post data transfer stage */
 		if ((dev->dp) && (dev->rd)) {
 			if ((dev->mode == IMM_NIBBLE) || (dev->mode == IMM_PS2)) {
 				w_ctr(ppb, 0x4);
@@ -908,10 +894,10 @@ static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
 				w_ctr(ppb, 0x4);
 			}
 		}
-		cmd->SCp.phase++;
+		scsi_pointer->phase++;
+		fallthrough;
 
-		/* Phase 8 - Read status/message */
-	case 8:
+	case 8:		/* Phase 8 - Read status/message */
 		/* Check for data overrun */
 		if (imm_wait(dev) != (unsigned char) 0xb8) {
 			imm_fail(dev, DID_ERROR);
@@ -923,7 +909,7 @@ static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
 			/* Check for optional message byte */
 			if (imm_wait(dev) == (unsigned char) 0xb8)
 				imm_in(dev, &h, 1);
-			cmd->result = (DID_OK << 16) + (l & STATUS_MASK);
+			cmd->result = (DID_OK << 16) | (l & STATUS_MASK);
 		}
 		if ((dev->mode == IMM_NIBBLE) || (dev->mode == IMM_PS2)) {
 			w_ctr(ppb, 0x4);
@@ -932,7 +918,6 @@ static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
 			w_ctr(ppb, 0x4);
 		}
 		return 0;	/* Finished */
-		break;
 
 	default:
 		printk("imm: Invalid scsi phase\n");
@@ -940,8 +925,7 @@ static int imm_engine(imm_struct *dev, struct scsi_cmnd *cmd)
 	return 0;
 }
 
-static int imm_queuecommand(struct scsi_cmnd *cmd,
-		void (*done)(struct scsi_cmnd *))
+static int imm_queuecommand_lck(struct scsi_cmnd *cmd)
 {
 	imm_struct *dev = imm_dev(cmd->device->host);
 
@@ -952,17 +936,17 @@ static int imm_queuecommand(struct scsi_cmnd *cmd,
 	dev->failed = 0;
 	dev->jstart = jiffies;
 	dev->cur_cmd = cmd;
-	cmd->scsi_done = done;
 	cmd->result = DID_ERROR << 16;	/* default return code */
-	cmd->SCp.phase = 0;	/* bus free */
+	imm_scsi_pointer(cmd)->phase = 0;	/* bus free */
 
-	INIT_WORK(&dev->imm_tq, imm_interrupt, dev);
-	schedule_work(&dev->imm_tq);
+	schedule_delayed_work(&dev->imm_tq, 0);
 
 	imm_pb_claim(dev);
 
 	return 0;
 }
+
+static DEF_SCSI_QCMD(imm_queuecommand)
 
 /*
  * Apparently the disk->capacity attribute is off by 1 sector 
@@ -992,15 +976,13 @@ static int imm_abort(struct scsi_cmnd *cmd)
 	 * have tied the SCSI_MESSAGE line high in the interface
 	 */
 
-	switch (cmd->SCp.phase) {
+	switch (imm_scsi_pointer(cmd)->phase) {
 	case 0:		/* Do not have access to parport */
 	case 1:		/* Have not connected to interface */
 		dev->cur_cmd = NULL;	/* Forget the problem */
 		return SUCCESS;
-		break;
 	default:		/* SCSI command sent, can not abort */
 		return FAILED;
-		break;
 	}
 }
 
@@ -1020,19 +1002,19 @@ static int imm_reset(struct scsi_cmnd *cmd)
 {
 	imm_struct *dev = imm_dev(cmd->device->host);
 
-	if (cmd->SCp.phase)
+	if (imm_scsi_pointer(cmd)->phase)
 		imm_disconnect(dev);
 	dev->cur_cmd = NULL;	/* Forget the problem */
 
 	imm_connect(dev, CONNECT_NORMAL);
 	imm_reset_pulse(dev->base);
-	udelay(1000);		/* device settle delay */
+	mdelay(1);		/* device settle delay */
 	imm_disconnect(dev);
-	udelay(1000);		/* device settle delay */
+	mdelay(1);		/* device settle delay */
 	return SUCCESS;
 }
 
-static int device_check(imm_struct *dev)
+static int device_check(imm_struct *dev, bool autodetect)
 {
 	/* This routine looks for a device and then attempts to use EPP
 	   to send a command. If all goes as planned then EPP is available. */
@@ -1044,8 +1026,8 @@ static int device_check(imm_struct *dev)
 	old_mode = dev->mode;
 	for (loop = 0; loop < 8; loop++) {
 		/* Attempt to use EPP for Test Unit Ready */
-		if ((ppb & 0x0007) == 0x0000)
-			dev->mode = IMM_EPP_32;
+		if (autodetect && (ppb & 0x0007) == 0x0000)
+			dev->mode = IMM_EPP_8;
 
 	      second_pass:
 		imm_connect(dev, CONNECT_EPP_MAYBE);
@@ -1070,7 +1052,7 @@ static int device_check(imm_struct *dev)
 			udelay(1000);
 			imm_disconnect(dev);
 			udelay(1000);
-			if (dev->mode == IMM_EPP_32) {
+			if (dev->mode != old_mode) {
 				dev->mode = old_mode;
 				goto second_pass;
 			}
@@ -1095,7 +1077,7 @@ static int device_check(imm_struct *dev)
 			udelay(1000);
 			imm_disconnect(dev);
 			udelay(1000);
-			if (dev->mode == IMM_EPP_32) {
+			if (dev->mode != old_mode) {
 				dev->mode = old_mode;
 				goto second_pass;
 			}
@@ -1118,32 +1100,20 @@ static int device_check(imm_struct *dev)
 	return -ENODEV;
 }
 
-static int imm_adjust_queue(struct scsi_device *device)
-{
-	blk_queue_bounce_limit(device->request_queue, BLK_BOUNCE_HIGH);
-	return 0;
-}
-
-static struct scsi_host_template imm_template = {
+static const struct scsi_host_template imm_template = {
 	.module			= THIS_MODULE,
 	.proc_name		= "imm",
-	.proc_info		= imm_proc_info,
+	.show_info		= imm_show_info,
+	.write_info		= imm_write_info,
 	.name			= "Iomega VPI2 (imm) interface",
 	.queuecommand		= imm_queuecommand,
 	.eh_abort_handler	= imm_abort,
-	.eh_bus_reset_handler	= imm_reset,
 	.eh_host_reset_handler	= imm_reset,
 	.bios_param		= imm_biosparam,
 	.this_id		= 7,
 	.sg_tablesize		= SG_ALL,
-	.cmd_per_lun		= 1,
-	.use_clustering		= ENABLE_CLUSTERING,
 	.can_queue		= 1,
-	.slave_alloc		= imm_adjust_queue,
-	.unchecked_isa_dma	= 1, /* imm cannot deal with highmem, so
-				      * this is an easy trick to ensure
-				      * all io pages for this host reside
-				      * in low memory */
+	.cmd_size		= sizeof(struct scsi_pointer),
 };
 
 /***************************************************************************
@@ -1152,31 +1122,60 @@ static struct scsi_host_template imm_template = {
 
 static LIST_HEAD(imm_hosts);
 
+/*
+ * Finds the first available device number that can be alloted to the
+ * new imm device and returns the address of the previous node so that
+ * we can add to the tail and have a list in the ascending order.
+ */
+
+static inline imm_struct *find_parent(void)
+{
+	imm_struct *dev, *par = NULL;
+	unsigned int cnt = 0;
+
+	if (list_empty(&imm_hosts))
+		return NULL;
+
+	list_for_each_entry(dev, &imm_hosts, list) {
+		if (dev->dev_no != cnt)
+			return par;
+		cnt++;
+		par = dev;
+	}
+
+	return par;
+}
+
 static int __imm_attach(struct parport *pb)
 {
 	struct Scsi_Host *host;
-	imm_struct *dev;
-	DECLARE_WAIT_QUEUE_HEAD(waiting);
+	imm_struct *dev, *temp;
+	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(waiting);
 	DEFINE_WAIT(wait);
 	int ports;
-	int modes, ppb;
 	int err = -ENOMEM;
+	struct pardev_cb imm_cb;
 
 	init_waitqueue_head(&waiting);
 
-	dev = kmalloc(sizeof(imm_struct), GFP_KERNEL);
+	dev = kzalloc(sizeof(imm_struct), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
 
-	memset(dev, 0, sizeof(imm_struct));
 
 	dev->base = -1;
-	dev->mode = IMM_AUTODETECT;
+	dev->mode = mode < IMM_UNKNOWN ? mode : IMM_AUTODETECT;
 	INIT_LIST_HEAD(&dev->list);
 
-	dev->dev = parport_register_device(pb, "imm", NULL, imm_wakeup,
-						NULL, 0, dev);
+	temp = find_parent();
+	if (temp)
+		dev->dev_no = temp->dev_no + 1;
 
+	memset(&imm_cb, 0, sizeof(imm_cb));
+	imm_cb.private = dev;
+	imm_cb.wakeup = imm_wakeup;
+
+	dev->dev = parport_register_dev_model(pb, "imm", &imm_cb, dev->dev_no);
 	if (!dev->dev)
 		goto out;
 
@@ -1200,18 +1199,9 @@ static int __imm_attach(struct parport *pb)
 	}
 	dev->waiting = NULL;
 	finish_wait(&waiting, &wait);
-	ppb = dev->base = dev->dev->port->base;
+	dev->base = dev->dev->port->base;
 	dev->base_hi = dev->dev->port->base_hi;
-	w_ctr(ppb, 0x0c);
-	modes = dev->dev->port->modes;
-
-	/* Mode detection works up the chain of speed
-	 * This avoids a nasty if-then-else-if-... tree
-	 */
-	dev->mode = IMM_NIBBLE;
-
-	if (modes & PARPORT_MODE_TRISTATE)
-		dev->mode = IMM_PS2;
+	w_ctr(dev->base, 0x0c);
 
 	/* Done configuration */
 
@@ -1228,19 +1218,23 @@ static int __imm_attach(struct parport *pb)
 	else
 		ports = 8;
 
-	INIT_WORK(&dev->imm_tq, imm_interrupt, dev);
+	INIT_DELAYED_WORK(&dev->imm_tq, imm_interrupt);
 
 	err = -ENOMEM;
 	host = scsi_host_alloc(&imm_template, sizeof(imm_struct *));
 	if (!host)
 		goto out1;
+	host->no_highmem = true;
 	host->io_port = pb->base;
 	host->n_io_port = ports;
 	host->dma_channel = -1;
 	host->unique_id = pb->number;
 	*(imm_struct **)&host->hostdata = dev;
 	dev->host = host;
-	list_add_tail(&dev->list, &imm_hosts);
+	if (!temp)
+		list_add_tail(&dev->list, &imm_hosts);
+	else
+		list_add_tail(&dev->list, &temp->list);
 	err = scsi_add_host(host, NULL);
 	if (err)
 		goto out2;
@@ -1278,23 +1272,11 @@ static void imm_detach(struct parport *pb)
 }
 
 static struct parport_driver imm_driver = {
-	.name	= "imm",
-	.attach	= imm_attach,
-	.detach	= imm_detach,
+	.name		= "imm",
+	.match_port	= imm_attach,
+	.detach		= imm_detach,
+	.devmodel	= true,
 };
-
-static int __init imm_driver_init(void)
-{
-	printk("imm: Version %s\n", IMM_VERSION);
-	return parport_register_driver(&imm_driver);
-}
-
-static void __exit imm_driver_exit(void)
-{
-	parport_unregister_driver(&imm_driver);
-}
-
-module_init(imm_driver_init);
-module_exit(imm_driver_exit);
+module_parport_driver(imm_driver);
 
 MODULE_LICENSE("GPL");
